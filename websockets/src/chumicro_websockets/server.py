@@ -7,31 +7,32 @@ the user's ``on_connection`` callback, and drives the per-connection
 state machines from its own :meth:`check` / :meth:`handle` runner
 contract.
 
-Standalone-port shape only in v1 — sharing a port with
+Standalone-port shape only in v1.  Sharing a port with
 :class:`chumicro_http_server.HttpServer` is a v2 ask (would require
 peek-then-route on the HTTP request line).  The optional
 *accept_path* knob lets a server filter inbound upgrades by URI
 path.
 
-The OPEN/CLOSING/CLOSED machinery — frame dispatch, oversize policy,
-control-frame handling, close handshake, send queue, pong watchdog —
-lives in :class:`chumicro_websockets._session._BaseSession`, shared
-with :class:`chumicro_websockets.client.WebSocketClient`.  This file
-owns only the server-specific bits: opening-handshake direction
-(parse request → send 101), outbound-mask discipline (servers MUST
-NOT mask), and the accept-loop in :class:`WebSocketServer`.
+Everything from OPEN onward is shared with
+:class:`chumicro_websockets.client.WebSocketClient` through
+:class:`chumicro_websockets._session._BaseSession`.  This file owns
+the server-specific bits: the opening-handshake direction (parse
+request, send 101), outbound-mask discipline (servers MUST NOT mask),
+and the accept-loop in :class:`WebSocketServer`.
 """
+
+import errno
 
 from chumicro_websockets._session import (
     WhenOversized,
     _BaseSession,
     _force_non_blocking,
-    _is_eagain,
 )
 from chumicro_websockets._wire import (
     CLOSE_NORMAL,
     DEFAULT_CLOSE_TIMEOUT_MS,
     DEFAULT_HANDSHAKE_TIMEOUT_MS,
+    DEFAULT_MAX_INBOUND_QUEUE_SIZE,
     DEFAULT_MAX_MESSAGE_BYTES,
     DEFAULT_MAX_TX_QUEUE_SIZE,
     DEFAULT_PONG_TIMEOUT_MS,
@@ -53,7 +54,7 @@ from chumicro_websockets._wire import (
 
 
 class ServerHandshakePhase:
-    """Sub-states inside CONNECTING — server-side, opposite order from
+    """Sub-states inside CONNECTING.  Server-side, opposite order from
     the client: read the request first, then write the 101 response.
     """
 
@@ -74,14 +75,14 @@ class Connection(_BaseSession):
     side outbound is never masked (RFC 6455 §5.1).
 
     Public surface: :meth:`send_text` / :meth:`send_binary` /
-    :meth:`send_ping` / :meth:`close`; :attr:`state`,
+    :meth:`send_ping` / :meth:`close`.  Attributes :attr:`state`,
     :attr:`last_close_code`, :attr:`last_close_reason`,
     :attr:`last_error`, :attr:`request_path`, :attr:`request_headers`
-    (set once OPEN); callbacks ``on_text`` / ``on_binary`` /
+    (set once OPEN).  Callbacks ``on_text`` / ``on_binary`` /
     ``on_ping`` / ``on_pong`` / ``on_close`` / ``on_oversized``.
     """
 
-    _role_label = "client"  # error messages describe what the *peer* sent
+    _peer_label = "client"  # label names the peer in error messages
     _inbound_mask_required = True  # clients MUST mask outbound
 
     def __init__(
@@ -100,6 +101,7 @@ class Connection(_BaseSession):
         close_timeout_ms: int,
         ticks,
         on_connection_callback,
+        max_inbound_queue_size: int = DEFAULT_MAX_INBOUND_QUEUE_SIZE,
     ) -> None:
         _force_non_blocking(socket)
         self._init_session_state(
@@ -112,6 +114,7 @@ class Connection(_BaseSession):
             pong_timeout_ms=pong_timeout_ms,
             handshake_timeout_ms=handshake_timeout_ms,
             close_timeout_ms=close_timeout_ms,
+            max_inbound_queue_size=max_inbound_queue_size,
             ticks=ticks,
         )
 
@@ -132,11 +135,19 @@ class Connection(_BaseSession):
     # Server-driven runner (called by WebSocketServer)
     # ------------------------------------------------------------------
 
-    def check(self, now_ms: int) -> bool:
+    def check(self, now_ms: int) -> bool:  # noqa: ARG002 - runner contract
         """Return ``True`` if there's work to do for this connection."""
-        if self.state == WebSocketState.CLOSED:
-            return False
-        return True
+        return self.state != WebSocketState.CLOSED
+
+    def _connecting_wants_read(self, now_ms) -> bool:  # noqa: ARG002 - runner contract
+        """The server reads during the first handshake leg (waiting on
+        the client's upgrade request)."""
+        return self._handshake_phase == ServerHandshakePhase.READING_REQUEST
+
+    def _connecting_wants_write(self, now_ms) -> bool:  # noqa: ARG002 - runner contract
+        """The server writes during the second handshake leg (sending the
+        HTTP 101 response bytes)."""
+        return self._handshake_phase == ServerHandshakePhase.SENDING_RESPONSE
 
     def handle(self, now_ms: int) -> None:
         """One tick of progress for this connection."""
@@ -153,7 +164,7 @@ class Connection(_BaseSession):
                 self._send_handshake_chunk(now_ms)
             return
 
-        # OPEN / CLOSING — drain inbound first, then outbound.
+        # OPEN / CLOSING: drain inbound first, then outbound.
         self._drain_inbound(now_ms)
         self._drain_outbound()
 
@@ -170,7 +181,7 @@ class Connection(_BaseSession):
         self._handshake_deadline_ticks = None
 
     # ------------------------------------------------------------------
-    # Internal: handshake — server reads first, then sends 101
+    # Internal: handshake.  Server reads first, then sends 101.
     # ------------------------------------------------------------------
 
     def _receive_handshake_chunk(self, now_ms: int) -> None:  # noqa: ARG002 - now_ms reserved for handshake-deadline parity
@@ -191,7 +202,7 @@ class Connection(_BaseSession):
             return
         if self._handshake_request_parser.state != HandshakeParseState.DONE:
             return
-        # Path filter — reject anything that doesn't match.
+        # Path filter: reject anything that doesn't match.
         if (
             self._accept_path is not None
             and self._handshake_request_parser.path != self._accept_path
@@ -204,6 +215,7 @@ class Connection(_BaseSession):
         self._handshake_send_buffer = encode_server_handshake_response(
             self._handshake_request_parser.client_key,
         )
+        self._handshake_send_view = memoryview(self._handshake_send_buffer)
         self._handshake_send_offset = 0
         self.request_path = self._handshake_request_parser.path
         self.request_headers = self._handshake_request_parser.headers
@@ -217,13 +229,14 @@ class Connection(_BaseSession):
     def _enter_open(self, now_ms: int) -> None:
         """Transition from sending-response to OPEN; fire user callback."""
         self._handshake_request_parser = None
+        self._handshake_send_view = None
         self._handshake_send_buffer = None
         self._handshake_phase = None
         self._handshake_deadline_ticks = None
         self.state = WebSocketState.OPEN
         # Hand the connection to the user so they can wire callbacks.
         # Errors from the user callback transition us to CLOSED with
-        # CLOSE_INTERNAL_ERROR — the connection isn't viable without
+        # CLOSE_INTERNAL_ERROR.  The connection isn't viable without
         # the callbacks the user was supposed to install.
         try:
             self._on_connection_callback(self)
@@ -234,8 +247,8 @@ class Connection(_BaseSession):
                 ),
             )
             return
-        # Drain any leftover bytes the request parser carried over —
-        # the client may have piggybacked frame bytes after the
+        # Drain any leftover bytes the request parser carried over.
+        # The client may have piggybacked frame bytes after the
         # request terminator.
         if self._post_handshake_carry:
             self._feed_frame_bytes(self._post_handshake_carry, now_ms)
@@ -280,31 +293,34 @@ class WebSocketServer:
     """Runner-shaped WebSocket server owning a TCP/TLS listening socket.
 
     *listener* is typically from
-    :func:`chumicro_sockets.tcp_listening_socket` /
-    :func:`tls_listening_socket`.  *on_connection* (``callable(connection)``)
+    ``chumicro_sockets.listener`` (plain or ``tls=True``).  *on_connection* (``callable(connection)``)
     fires once per inbound connection at handshake completion; it
     wires ``connection.on_text`` / ``on_binary`` / ``on_close`` etc.
     before any frames arrive.  Raising from the callback rejects with
-    :data:`CLOSE_INTERNAL_ERROR`.  Standalone-port shape only in v1;
+    :data:`CLOSE_INTERNAL_ERROR`.  Standalone-port shape only in v1.
     ``accept_path`` filters by URI path with 404 on mismatch.
 
-    For config-driven construction, see :meth:`from_config` —
+    For config-driven construction, see :meth:`from_config`: a
     one-line factory that builds the listener from
     ``websockets.server.host`` / ``port`` and reads
     ``websockets.server.max_message_bytes`` from
     ``runtime_config.msgpack``.
 
-    Knobs: ``max_connections`` (default 2; inbound accepts past the
-    cap close immediately to bound heap + per-tick work);
-    ``max_message_bytes`` / ``recv_budget_per_tick`` /
-    ``send_budget_per_tick`` / ``max_tx_queue_size`` / ``when_oversized`` /
-    ``pong_timeout_ms`` / ``handshake_timeout_ms`` /
-    ``close_timeout_ms`` — same semantics as
-    :class:`WebSocketClient`, applied per-connection;
-    ``ticks`` — optional tick source (any object exposing
-    ``ticks_ms`` / ``ticks_diff`` / ``ticks_add``); defaults to
-    :mod:`chumicro_timing`'s ``ticks`` submodule.  Tests pass
-    ``FakeTicks`` from :mod:`chumicro_timing.testing`.
+    Knobs:
+
+    * ``max_connections``: default 2.  While the cap is reached the
+      server stops calling ``accept()``, so excess clients wait in the
+      listen backlog (and time out there) until a slot frees; this
+      bounds heap + per-tick work.
+    * ``max_message_bytes`` / ``recv_budget_per_tick`` /
+      ``send_budget_per_tick`` / ``max_tx_queue_size`` /
+      ``when_oversized`` / ``pong_timeout_ms`` /
+      ``handshake_timeout_ms`` / ``close_timeout_ms``: same
+      semantics as :class:`WebSocketClient`, applied per-connection.
+    * ``ticks``: optional tick source (any object exposing
+      ``ticks_ms`` / ``ticks_diff`` / ``ticks_add``).  Defaults to
+      the :mod:`chumicro_timing` ``ticks`` submodule.  Tests pass
+      ``FakeTicks`` from :mod:`chumicro_timing.testing`.
     """
 
     @classmethod
@@ -325,15 +341,25 @@ class WebSocketServer:
         — empty ``config`` produces a server bound to ``0.0.0.0:8765``.
         *on_connection* is required (wires per-connection callbacks
         before frames arrive).  A *listener* override bypasses the
-        auto-built :func:`chumicro_sockets.tcp_listening_socket`.
+        auto-built :func:`chumicro_sockets.listener`.
         *accept_path* + *max_connections* are app-routing knobs not
         in the config manifest.
         """
         if listener is None:
-            from chumicro_sockets import tcp_listening_socket  # noqa: PLC0415
-            host = config.get("websockets.server.host", "0.0.0.0")
-            port = config.get("websockets.server.port", 8765)
-            listener = tcp_listening_socket(host, port, radio=radio)
+            # Lazy import through the skippable factory submodule so a
+            # client-only deploy (or one excluding factories) never pulls
+            # chumicro_sockets in via this eagerly-imported server module.
+            try:
+                from chumicro_websockets.sockets_factory import (  # noqa: PLC0415 - lazy
+                    chumicro_sockets_listener,
+                )
+            except ImportError as exception:
+                raise RuntimeError(
+                    "chumicro_websockets.sockets_factory not available "
+                    "(excluded via __chumicro_skip_factories__ or not on "
+                    "the board) — pass listener= explicitly.",
+                ) from exception
+            listener = chumicro_sockets_listener(config, radio=radio)
         return cls(
             listener=listener,
             on_connection=on_connection,
@@ -360,6 +386,7 @@ class WebSocketServer:
         pong_timeout_ms: int = DEFAULT_PONG_TIMEOUT_MS,
         handshake_timeout_ms: int = DEFAULT_HANDSHAKE_TIMEOUT_MS,
         close_timeout_ms: int = DEFAULT_CLOSE_TIMEOUT_MS,
+        max_inbound_queue_size: int = DEFAULT_MAX_INBOUND_QUEUE_SIZE,
         ticks: object | None = None,
     ) -> None:
         self._listener = listener
@@ -374,6 +401,7 @@ class WebSocketServer:
         self._pong_timeout_ms = pong_timeout_ms
         self._handshake_timeout_ms = handshake_timeout_ms
         self._close_timeout_ms = close_timeout_ms
+        self._max_inbound_queue_size = max_inbound_queue_size
 
         if ticks is None:
             from chumicro_timing import ticks  # noqa: PLC0415 - DI fallback
@@ -381,6 +409,11 @@ class WebSocketServer:
 
         self._connections: list[Connection] = []
         self.closed = False
+        #: Most recent non-EAGAIN ``listener.accept()`` failure.  Stays
+        #: ``None`` while the listener is healthy.  Set by the accept
+        #: loop; the caller decides whether to rebuild the listener
+        #: or shut down.
+        self.last_error: BaseException | None = None
 
     # ------------------------------------------------------------------
     # Public observation
@@ -428,13 +461,14 @@ class WebSocketServer:
     # Runner contract
     # ------------------------------------------------------------------
 
-    def check(self, now_ms: int) -> bool:
-        """Return ``True`` if there's work to do this tick."""
-        if self.closed:
-            return False
-        # Always True — accept loop must run, and any active connection
-        # may need attention.  Conservative; cheap enough.
-        return True
+    def check(self, now_ms: int) -> bool:  # noqa: ARG002 - runner contract
+        """Return ``True`` if there's work to do this tick.
+
+        Always ``True`` until :meth:`close`: the accept loop must run,
+        and any active connection may need attention.  Conservative
+        and cheap.
+        """
+        return not self.closed
 
     def handle(self, now_ms: int) -> None:
         """Accept new connections + advance every active connection one tick."""
@@ -445,10 +479,19 @@ class WebSocketServer:
         # handle() can mutate the list without breaking iteration.
         for connection in list(self._connections):
             if connection.state == WebSocketState.CLOSED:
-                self._connections.remove(connection)
+                if connection in self._connections:
+                    self._connections.remove(connection)
                 continue
             connection.handle(now_ms)
-            if connection.state == WebSocketState.CLOSED:
+            # A connection callback may call server.close(), which
+            # finalizes and clears every connection; stop here rather
+            # than removing an entry that is already gone.
+            if self.closed:
+                return
+            if (
+                connection.state == WebSocketState.CLOSED
+                and connection in self._connections
+            ):
                 self._connections.remove(connection)
 
     # ------------------------------------------------------------------
@@ -456,17 +499,21 @@ class WebSocketServer:
     # ------------------------------------------------------------------
 
     def _accept_pending(self, now_ms: int) -> None:
-        """Drain any pending accepts up to the connection cap."""
+        """Drain any pending accepts up to the connection cap.
+
+        A non-EAGAIN ``accept()`` failure is recorded on
+        :attr:`last_error` and the loop yields; the caller decides
+        whether to rebuild the listener or shut down.
+        """
         while True:
             if len(self._connections) >= self._max_connections:
                 return
             try:
                 accepted = self._listener.accept()
-            except Exception as accept_error:  # noqa: BLE001 - narrow below
-                if _is_eagain(accept_error):
+            except OSError as accept_error:
+                if accept_error.errno == errno.EAGAIN:
                     return
-                # Listener errors are fatal-ish; record + close.
-                # Caller decides whether to rebuild the listener.
+                self.last_error = accept_error
                 return
             if accepted is None:
                 return
@@ -483,6 +530,7 @@ class WebSocketServer:
                 pong_timeout_ms=self._pong_timeout_ms,
                 handshake_timeout_ms=self._handshake_timeout_ms,
                 close_timeout_ms=self._close_timeout_ms,
+                max_inbound_queue_size=self._max_inbound_queue_size,
                 ticks=self._ticks,
                 on_connection_callback=self._on_connection,
             )

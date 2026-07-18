@@ -1,9 +1,9 @@
 """Flat-key runtime-config wrapper + section-loading helpers.
 
 The on-device runtime config is a flat dict with dotted keys
-(``"wifi.ssid"``, ``"mqtt.broker.host"``) — compose-time flattening on
+(``"wifi.ssid"``, ``"mqtt.broker.host"``). Compose-time flattening on
 the host turns nested TOML tables into this shape before the msgpack
-encode.  :class:`RuntimeConfig` wraps that dict for keyed access;
+encode.  :class:`RuntimeConfig` wraps that dict for keyed access.
 :func:`load_section` / :func:`try_load_section` build typed
 ``<Name>Config`` instances from it.
 """
@@ -55,14 +55,8 @@ class RuntimeConfig:
         return key in self._data
 
 
-def is_config_like(value) -> bool:
-    """Return ``True`` when *value* is a :class:`RuntimeConfig` or plain dict.
-
-    The input gate :func:`load_section` applies internally — call it
-    explicitly at the top of any consumer ``from_config`` that bypasses
-    ``load_section`` (the client-with-injection pattern in the user
-    guide), raising :class:`InvalidConfigType` on the failing branch.
-    """
+def _is_config_like(value) -> bool:
+    """Return ``True`` when *value* is a :class:`RuntimeConfig` or plain dict."""
     return isinstance(value, (RuntimeConfig, dict))
 
 
@@ -79,7 +73,7 @@ def load_section(
     For each name in *required* / *optional*, reads
     ``config[f"{prefix}.{name}"]`` and passes it as the keyword
     argument *name* to ``target_class(**kwargs)``.  Missing required
-    keys raise :class:`MissingConfigKey`; a *config* that isn't a
+    keys raise :class:`MissingConfigKey`. A *config* that isn't a
     :class:`RuntimeConfig` / dict raises :class:`InvalidConfigType`.
     Soft "config not deployed" handling belongs in
     :func:`try_load_section`.
@@ -88,7 +82,7 @@ def load_section(
         raise InvalidConfigType(
             "load_section requires a runtime config; got None",
         )
-    if not is_config_like(config):
+    if not _is_config_like(config):
         raise InvalidConfigType(
             f"load_section requires a RuntimeConfig or dict, "
             f"got {type(config).__name__}",
@@ -123,15 +117,18 @@ def try_load_section(
     required: tuple = (),
     optional: dict | None = None,
 ) -> object | None:
-    """Soft-load — return ``None`` whenever :func:`load_section` would raise.
+    """Soft-load: return ``None`` instead of the ``ConfigError`` raises.
 
     Three skip-paths return ``None``: *config* is ``None`` (no
     runtime config deployed), *config* is the wrong type, or a required
     key is missing.  Treat the ``None`` return as "this section isn't
-    configured; skip the feature."
+    configured, skip the feature."  Errors from constructing
+    *target_class* (a ``TypeError`` for an unexpected keyword, or the
+    class's own validation) are not skip-paths and propagate.
     """
-    if config is None or not is_config_like(config):
-        return None
+    # No upfront None / type guard: load_section already raises
+    # InvalidConfigType for a None or non-config-like argument, and the
+    # except below turns that into the same None return.
     try:
         return load_section(
             target_class,

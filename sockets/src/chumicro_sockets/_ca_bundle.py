@@ -43,7 +43,13 @@ viable on a 256 KB board.
 
 __chumicro_runtimes__ = ("micropython",)
 
-#: Canonical flash-deploy location, used only if ``__file__`` is
+#: Sibling data file this module opens at runtime.  The deploy
+#: import-walker reads this marker (it can't see the runtime ``open``)
+#: and stages the listed files next to the module; without it the .der
+#: was silently dropped and the first TLS connect crashed with OSError.
+__chumicro_data_files__ = ("_ca_bundle.der",)
+
+#: Fallback flash-deploy location, used only if ``__file__`` is
 #: unavailable on a given MP build.
 _FALLBACK_PATH = "/lib/chumicro_sockets/_ca_bundle.der"
 
@@ -51,11 +57,11 @@ _FALLBACK_PATH = "/lib/chumicro_sockets/_ca_bundle.der"
 def read_der():
     """Return the shipped bundle's concatenated DER bytes.
 
-    The caller (``_adapters.mp._default_context``) feeds the result
-    straight into ``ssl_context_with_ca`` and keeps no reference, so
-    the buffer is collectable as soon as ``load_verify_locations`` has
-    copied it into mbedTLS — the tight lifetime is the whole point of
-    shipping a file (see module docstring).
+    The caller (``_adapters.mp._resolve_default_context``) feeds the
+    result straight into ``ssl_context_with_ca`` and keeps no reference,
+    so the buffer is collectable as soon as ``load_verify_locations``
+    has copied it into mbedTLS — the tight lifetime is the whole point
+    of shipping a file (see module docstring).
     """
     try:
         here = __file__.rsplit("/", 1)[0]

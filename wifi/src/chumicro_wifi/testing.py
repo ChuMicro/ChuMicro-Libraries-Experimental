@@ -1,7 +1,7 @@
 """Test helpers for libraries that depend on ``chumicro-wifi``.
 
-Downstream consumers import ``FakeWifi`` rather than inventing
-ad-hoc mocks.
+``FakeWifi`` is here for downstream libraries to test against
+instead of hand-rolling a wifi mock.
 
 Example::
 
@@ -15,17 +15,15 @@ Example::
     fake_wifi.tick()
     assert fake_wifi.state == "connected"
 
-This module hosts both the test fakes (``FakeWifi``,
-``FakeWifiAdapter``) and the CPython-default adapter the production
-``WifiService`` falls back to when no real runtime adapter applies.
-The ``__chumicro_test_support__`` marker below keeps the file out of
-every bundle and every product / app / functional device deploy, so
-the fakes and the CPython-default adapter stay host-side — exactly
-where they're needed (the on-device unit sweep is the one path that
-stages it; CPython is a host-test seam, not a deploy target).
+This module hosts the test fakes (``FakeWifi``,
+``FakeWifiAdapter``) plus the CPython-default adapter that
+``WifiService`` falls back to when no runtime-specific adapter
+applies.  The ``__chumicro_test_support__`` marker below keeps the
+file off device deploys, except for the on-device unit sweep that
+stages it to exercise the fakes on real hardware.
 """
 
-#: Source bundle / sdist only -- never lands on a device.
+#: Source bundle / sdist only.  Never lands on a device.
 __chumicro_test_support__ = True
 
 from chumicro_wifi._adapters.base import WifiAdapter
@@ -38,15 +36,28 @@ class FakeWifiAdapter(WifiAdapter):
 
     The connection lifecycle is driven by:
 
-    * :meth:`set_connect_outcome` — controls what the next
+    * :meth:`set_connect_outcome`: controls what the next
       :meth:`connect` returns (``True`` for success, ``False`` for
       a clean refusal, an exception class to raise, or a one-shot
       sequence via :meth:`set_connect_outcomes`).
-    * :meth:`drop_link` — simulates a link-down event; the next
+    * :meth:`drop_link`: simulates a link-down event.  The next
       :meth:`is_linked` returns ``False``, triggering the service's
-      reconnect path.
-    * :meth:`record` — every adapter call appends to ``self.calls``
-      so tests can assert call ordering and arguments.
+      reconnect path.  :meth:`restore_link` is its complement — the AP
+      coming back on its own, for modelling a flapping link.
+    * :meth:`set_deferred_link`: models a non-blocking (MicroPython)
+      association that dispatches on :meth:`connect` and reports link-up
+      only after a few :meth:`is_linked` polls, so tests can exercise
+      the service's in-flight poll window through the real
+      ``check()`` / ``handle()`` cycle.
+    * ``self.calls``: every adapter call (``configure``, ``connect``)
+      appends a tuple so tests can assert call ordering and arguments.
+
+    ``connect_blocks`` defaults to ``True`` (a blocking substrate: a
+    ``connect() == False`` is a settled failure).  Flip it via
+    :meth:`set_connect_blocks` — or implicitly via
+    :meth:`set_deferred_link` — to model the non-blocking MicroPython
+    substrate, where ``connect() == False`` means "join dispatched,
+    still in flight".
     """
 
     name = "fake"
@@ -57,6 +68,12 @@ class FakeWifiAdapter(WifiAdapter):
         self._configured_with = None
         self._connect_outcomes = []
         self._default_connect_outcome = True
+        # Deferred (non-blocking) association: when set, connect() records
+        # a pending join and returns False; is_linked() flips True after
+        # this many polls.  ``None`` keeps the blocking, synchronous shape.
+        self._link_after = None
+        self._pending_polls = 0
+        self.connect_blocks = True
         self.calls = []
 
     # --- WifiAdapter implementation ----------------------------------
@@ -67,6 +84,11 @@ class FakeWifiAdapter(WifiAdapter):
 
     def connect(self, config):
         self.calls.append(("connect", config))
+        if self._link_after is not None:
+            # Non-blocking deferred join: dispatched but not yet linked.
+            # is_linked() resolves it over the next few polls.
+            self._pending_polls = self._link_after
+            return False
         outcome = self._next_outcome()
         if outcome is True:
             self._linked = True
@@ -77,11 +99,11 @@ class FakeWifiAdapter(WifiAdapter):
         # Anything else is treated as an exception class.
         raise outcome("simulated connect failure")
 
-    def disconnect(self):
-        self.calls.append(("disconnect",))
-        self._linked = False
-
     def is_linked(self):
+        if self._link_after is not None and self._pending_polls > 0:
+            self._pending_polls -= 1
+            if self._pending_polls == 0:
+                self._linked = True
         return self._linked
 
     def ip(self):
@@ -109,9 +131,40 @@ class FakeWifiAdapter(WifiAdapter):
         """
         self._connect_outcomes = list(outcomes)
 
+    def set_connect_blocks(self, blocks: bool) -> None:
+        """Toggle the blocking (CP) vs non-blocking (MP) ``connect`` model.
+
+        ``True`` (default): a ``connect() == False`` is a settled
+        failure.  ``False``: it means "join dispatched, still in
+        flight", so the service polls :meth:`is_linked` over its
+        ``connect_timeout_ms`` window before counting a failure.
+        """
+        self.connect_blocks = blocks
+
+    def set_deferred_link(self, *, link_after: int) -> None:
+        """Model a non-blocking join that links after *link_after* polls.
+
+        Puts the adapter in non-blocking mode (``connect_blocks =
+        False``): the next :meth:`connect` dispatches and returns
+        ``False``, and :meth:`is_linked` reports ``True`` on the
+        *link_after*-th poll after it — the shape of a real MicroPython
+        ``wlan.connect()`` whose association settles over seconds.
+        """
+        self._link_after = link_after
+        self.connect_blocks = False
+
     def drop_link(self):
         """Simulate a link-down event without disconnecting cleanly."""
         self._linked = False
+
+    def restore_link(self):
+        """Simulate the AP coming back on its own (no ``connect`` call).
+
+        Complement to :meth:`drop_link`: flips :meth:`is_linked` back to
+        ``True``, so tests can model a flapping link that bounces up
+        between the service's ``check()`` and ``handle()``.
+        """
+        self._linked = True
 
     @property
     def configured_with(self):
@@ -133,7 +186,7 @@ class FakeWifi(WifiService):
     the wrapper for ergonomic use in test code.
 
     Args:
-        ticks: A tick source — typically a
+        ticks: A tick source: typically a
             :class:`chumicro_timing.testing.FakeTicks` instance the
             test owns and advances explicitly.
         config: Optional :class:`WifiConfig`.  When ``None`` a
@@ -167,9 +220,21 @@ class FakeWifi(WifiService):
         """Forward to the underlying :class:`FakeWifiAdapter`."""
         self._fake_adapter.drop_link()
 
+    def restore_link(self):
+        """Forward to the underlying :class:`FakeWifiAdapter`."""
+        self._fake_adapter.restore_link()
+
+    def set_connect_blocks(self, blocks):
+        """Forward to the underlying :class:`FakeWifiAdapter`."""
+        self._fake_adapter.set_connect_blocks(blocks)
+
+    def set_deferred_link(self, *, link_after):
+        """Forward to the underlying :class:`FakeWifiAdapter`."""
+        self._fake_adapter.set_deferred_link(link_after=link_after)
+
     @property
     def calls(self):
-        """List of recorded adapter calls — assertion target for tests."""
+        """List of recorded adapter calls.  Assertion target for tests."""
         return self.adapter.calls
 
     # --- convenience for tick-driven tests ---------------------------

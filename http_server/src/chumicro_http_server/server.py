@@ -9,10 +9,10 @@ Per-connection state machine::
 
     WANT_REQUEST_LINE
       -> WANT_HEADERS
-        -> DISPATCHING        (handler runs synchronously here)
-          -> WANT_SEND_HEADERS
-            -> WANT_SEND_BODY
-              -> DONE / CLOSING
+        -> WANT_BODY            (skipped when Content-Length absent/0)
+          -> DISPATCHING        (handler runs synchronously here)
+            -> WANT_SEND_HEADERS
+              -> DONE
                            \\-> ERROR (any state)
 
 The handler is called once, after the full request (headers + any
@@ -22,28 +22,60 @@ The handler is called once, after the full request (headers + any
 path parameter are all wired up.
 """
 
+import errno
 import json
 
+# The opt-in ``chumicro_http_server.streaming`` submodule is imported
+# lazily inside the streaming code path (``_Connection._stage_streaming_
+# response`` / ``_drive_stream_body``), not here — a server that only
+# serves buffered responses never loads the streamed-body framing
+# machine's bytecode.  Only the two constants (which the constructor
+# signature and public surface need at import) live in ``_wire``.
 from chumicro_http_server._wire import (
     CRLF,
     DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_MAX_HEADERS_BYTES,
     DEFAULT_MAX_REQUEST_BODY_BYTES,
+    DEFAULT_MAX_REQUEST_LINE_BYTES,
     DEFAULT_RECV_BUDGET_PER_TICK,
     DEFAULT_REQUEST_TIMEOUT_MS,
     DEFAULT_SEND_BUDGET_PER_TICK,
+    DEFAULT_STREAM_BUFFER_SIZE,
     CaseInsensitiveDict,
     RequestParser,
     RequestParseState,
     ServerError,
-    ServerOversizedError,
+    ServerLimitError,
+    ServerProtocolError,
+    parse_charset,
     parse_query,
     split_target,
 )
 
+# Poll-interest bit for ``io_interest``; mirrors ``chumicro_runner.IO_READ``
+# by value.  Held as a literal rather than imported so the stack takes no
+# dependency edge on the runner (bring-your-own-scheduler).  Only the read bit is
+# used here — the listener never wants write.
+_IO_READ = 1
 
-def _is_eagain(error):
-    return getattr(error, "errno", None) in (11, 35)
+#: While a connection is in flight its socket is not in the runner's
+#: poll set (only the listener is), so ``next_deadline`` caps the wait
+#: at this interval to keep advancing the connection instead of sleeping
+#: to the far request-timeout deadline.  Small enough for low added
+#: latency, large enough not to busy-spin.
+_CONNECTION_PROGRESS_INTERVAL_MS = 20
 
+#: Pre-encoded, ASCII-only 500 used when a handler's own Response can't
+#: be encoded (a str body, a non-ASCII header / reason).  Literal bytes
+#: so the fallback itself can never fail to encode.
+_ENCODED_500_ERROR = (
+    b"HTTP/1.1 500 Internal Server Error\r\n"
+    b"Content-Type: text/plain; charset=utf-8\r\n"
+    b"Content-Length: 21\r\n"
+    b"Connection: close\r\n"
+    b"\r\n"
+    b"Internal Server Error"
+)
 
 #: Reason phrases for the status codes this server emits.
 _REASONS = {
@@ -56,26 +88,34 @@ _REASONS = {
     404: "Not Found",
     405: "Method Not Allowed",
     413: "Payload Too Large",
+    414: "URI Too Long",
+    431: "Request Header Fields Too Large",
     500: "Internal Server Error",
     503: "Service Unavailable",
 }
 
 
 def _force_non_blocking(socket):
-    """Best-effort ``setblocking(False)`` on a socket.
+    """Flip an accepted connection to non-blocking.
 
-    Same shape as the equivalent helper in chumicro-requests and
-    chumicro-mqtt — every accepted connection is flipped to non-
-    blocking up front so the per-connection state machine never
-    stalls on a read or write.
+    Every accepted connection is flipped up front so the per-connection
+    state machine never stalls on a read or write.
     """
-    setblocking = getattr(socket, "setblocking", None)
-    if setblocking is None:  # pragma: no cover - defensive (every supported sock has it)
-        return
-    try:
-        setblocking(False)
-    except (OSError, AttributeError):  # pragma: no cover — defensive
-        pass
+    socket.setblocking(False)
+
+
+def _split_pattern_path(path):
+    """Split *path* into ``(prefix, last_segment)`` for pattern-route lookup.
+
+    *prefix* is the path up to and including the final ``/``; *last_segment*
+    is everything after it.  An empty *last_segment* means the path has no
+    parameter-shaped trailing segment (caller treats this as "no pattern
+    match").  Returns ``("", "")`` for paths with no slash.
+    """
+    last_slash = path.rfind("/")
+    if last_slash == -1:
+        return "", ""
+    return path[:last_slash + 1], path[last_slash + 1:]
 
 
 # ---------------------------------------------------------------------------
@@ -122,8 +162,21 @@ class Request:
         self.path_params = {}
 
     def text(self) -> str:
-        """Return :attr:`body` decoded as ``str`` using utf-8."""
-        return self.body.decode("utf-8")
+        """Return :attr:`body` decoded with the request's Content-Type charset.
+
+        Looks up the ``charset`` parameter on the request's
+        ``Content-Type`` header (e.g. ``text/plain; charset=latin-1``)
+        and decodes the body with it.  Falls back to ``utf-8`` when no
+        Content-Type / no charset is present — matches RFC 8259 §8.1
+        for JSON and the web's current text default.
+
+        Only UTF-8 is decodable on every runtime.  MicroPython and
+        CircuitPython ship a UTF-8-only ``str`` codec, so a declared
+        non-UTF-8 charset (``latin-1``, ``iso-8859-1``, ...) either
+        raises or mis-decodes there.  Send UTF-8 bodies for portable
+        behavior.
+        """
+        return self.body.decode(parse_charset(self.headers.get("Content-Type")))
 
     def json(self) -> object:
         """Parse :attr:`body` as JSON; raises ``ValueError`` on bad data."""
@@ -134,12 +187,12 @@ class Request:
 
 
 class Response:
-    """Outbound HTTP response built by :meth:`HttpServer.respond`.
+    """Outbound HTTP response built by :func:`build_response`.
 
     Attributes:
         status_code: Integer HTTP status (e.g. ``200``).
         reason: Reason phrase (sourced from a small table; falls back
-            to ``"Unknown"`` for non-canonical codes).
+            to ``"Unknown"`` for codes outside the table).
         headers: :class:`CaseInsensitiveDict` to send with the response.
             ``Content-Length`` and ``Connection: close`` are added
             automatically by the writer.
@@ -166,6 +219,14 @@ class Response:
         )
 
 
+# ``StreamingResponse`` + ``build_streaming_response`` live in the opt-in
+# :mod:`chumicro_http_server.streaming` submodule, not here: the base
+# server recognizes a streaming response by duck type (its ``source``
+# attribute — see :meth:`_Connection._dispatch_handler`) and lazy-imports
+# the framing machine only to drive one, so a server that never streams
+# never loads that bytecode.
+
+
 # ---------------------------------------------------------------------------
 # Per-connection state machine
 # ---------------------------------------------------------------------------
@@ -179,9 +240,32 @@ class _ConnState:
     WANT_BODY = "want_body"
     DISPATCHING = "dispatching"
     WANT_SEND_HEADERS = "want_send_headers"
+    #: Streaming responses only: headers are flushed, the handler's byte
+    #: source is being drained + framed to the socket across ticks.
     WANT_SEND_BODY = "want_send_body"
     DONE = "done"
     ERROR = "error"
+
+
+#: Terminal connection states.  Hoisted to module scope so the per-tick
+#: ``is_done`` check reuses one tuple instead of rebuilding it every call —
+#: MicroPython and CircuitPython don't constant-fold tuples of attribute
+#: loads.
+_DONE_STATES = (_ConnState.DONE, _ConnState.ERROR)
+
+#: States in which the connection is still reading the request off the
+#: socket; drives the recv half of a tick.  Module-scoped for the same
+#: no-rebuild reason as :data:`_DONE_STATES`.
+_RECV_STATES = (
+    _ConnState.WANT_REQUEST_LINE,
+    _ConnState.WANT_HEADERS,
+    _ConnState.WANT_BODY,
+)
+
+#: Parser states at which :meth:`_Connection._drive_recv` stops looping —
+#: no more socket bytes can advance the parse.  Module-scoped so the
+#: per-recv-iteration test reuses one tuple.
+_PARSER_TERMINAL_STATES = (RequestParseState.DONE, RequestParseState.ERROR)
 
 
 class _Connection:
@@ -203,6 +287,9 @@ class _Connection:
         recv_budget,
         send_budget,
         max_request_body_bytes,
+        max_request_line_bytes,
+        max_headers_bytes,
+        stream_buffer_size,
     ):
         self._socket = socket
         self._peer = peer
@@ -210,38 +297,39 @@ class _Connection:
         self._deadline_ticks = deadline_ticks
         self._recv_budget = recv_budget
         self._send_budget = send_budget
+        self._stream_buffer_size = stream_buffer_size
         # No per-connection steady-state body buffer: every response
-        # emits ``Connection: close`` so each :class:`_Connection`
-        # serves exactly one request before being destroyed.  A
-        # pre-allocated buffer here would have a use-once lifetime —
-        # the same shape as the standalone case where
-        # ``chumicro_requests``'s on-device fragmentation tests
-        # measured a default-sized body buffer as a regression.  The
-        # parser starts empty and the sized-rebind path in
-        # :meth:`RequestParser._enter_body_state` does one allocation
-        # of ``bytearray(content_length)`` for the request.  When
-        # keep-alive lands and ``_Connection`` lives across requests,
-        # revisit and pass a long-lived buffer in here.
-        self._parser = RequestParser(max_body_bytes=max_request_body_bytes)
-        # Pre-allocated recv scratch reused by every :meth:`_drive_recv` call
-        # — mirrors :class:`chumicro_mqtt._wire.PacketDecoder` and
-        # ``chumicro_websockets._session.WebSocketSession``.  A 4-conn
-        # server with the default 1024-byte budget pins ~2 KB of steady-
-        # state heap (4 × min(1024, 512)) instead of churning a fresh
-        # bytearray per tick per connection.  Capped at 512 so a server
-        # configured with a large recv_budget doesn't pin big buffers
-        # per connection.
+        # emits ``Connection: close``, so each _Connection serves one
+        # request before destruction.  A use-once buffer would fragment
+        # worse than RequestParser's sized-rebind alloc per request.
+        self._parser = RequestParser(
+            max_body_bytes=max_request_body_bytes,
+            max_request_line_bytes=max_request_line_bytes,
+            max_headers_bytes=max_headers_bytes,
+        )
+        # Pre-allocated recv scratch reused by every :meth:`_drive_recv`
+        # call.  A 4-conn server with the default 1024-byte budget pins
+        # ~2 KB of steady-state heap (4 × min(1024, 512)) instead of
+        # churning a fresh bytearray per tick per connection.  Capped
+        # at 512 so a server configured with a large recv_budget doesn't
+        # pin big buffers per connection.
         recv_scratch_size = recv_budget if recv_budget <= 512 else 512
         self._recv_buffer = bytearray(recv_scratch_size)
         self._recv_view = memoryview(self._recv_buffer)
         self._response_bytes = b""
         self._response_view = memoryview(self._response_bytes)
         self._response_offset = 0
+        # Streaming send state.  Both stay ``None`` for the buffered path
+        # so a non-streaming connection allocates no staging window: the
+        # window is lazily minted only when a handler returns a
+        # :class:`StreamingResponse`.
+        self._stream = None
+        self._stream_buffer = None
         self.state = _ConnState.WANT_REQUEST_LINE
 
     @property
     def is_done(self):
-        return self.state in (_ConnState.DONE, _ConnState.ERROR)
+        return self.state in _DONE_STATES
 
     def tick(self, now_ms, *, ticks_diff_func):
         """Advance the connection by one tick's worth of work."""
@@ -251,24 +339,23 @@ class _Connection:
             self._fail()
             return
         try:
-            if self.state in (
-                _ConnState.WANT_REQUEST_LINE,
-                _ConnState.WANT_HEADERS,
-                _ConnState.WANT_BODY,
-            ):
+            if self.state in _RECV_STATES:
                 self._drive_recv()
             if self.state == _ConnState.DISPATCHING:
                 self._dispatch_handler()
-            if self.state in (
-                _ConnState.WANT_SEND_HEADERS,
-                _ConnState.WANT_SEND_BODY,
-            ):
+            if self.state == _ConnState.WANT_SEND_HEADERS:
                 self._drive_send()
-        except ServerOversizedError as oversized_error:
-            # 413 before any body bytes were allocated — surface the
-            # response cleanly instead of letting the connection die
-            # silently with a TCP close.
-            self._emit_error_response(413, str(oversized_error))
+            if self.state == _ConnState.WANT_SEND_BODY:
+                self._drive_stream_body()
+        except ServerLimitError as limit_error:
+            # A sender-controlled allocation hit a documented cap before
+            # the offending bytes were buffered or a body was allocated
+            # (413 oversized body / 414 request line / 431 headers).
+            # Surface the status the error carries instead of letting the
+            # connection die silently with a TCP close.
+            self._stage_response(
+                _build_error_response(limit_error.status_code, str(limit_error)),
+            )
         except (OSError, ServerError):
             # Either side of the wire died — drop the connection.  The
             # writer's response state is already past the point where a
@@ -281,7 +368,7 @@ class _Connection:
         if self._socket is not None:
             try:
                 self._socket.close()
-            except OSError:  # pragma: no cover — defensive
+            except OSError:  # pragma: no cover - defensive
                 pass
             self._socket = None
 
@@ -300,14 +387,12 @@ class _Connection:
         consumed = 0
         budget = self._recv_budget
         scratch_size = len(self._recv_buffer)
-        while consumed < budget and self._parser.state not in (
-            RequestParseState.DONE, RequestParseState.ERROR,
-        ):
+        while consumed < budget and self._parser.state not in _PARSER_TERMINAL_STATES:
             capacity = min(scratch_size, budget - consumed)
             try:
                 got = self._socket.recv_into(self._recv_view, capacity)
             except OSError as socket_error:
-                if _is_eagain(socket_error):
+                if socket_error.errno == errno.EAGAIN:
                     return
                 raise
             if got == 0:
@@ -342,17 +427,56 @@ class _Connection:
         )
         try:
             response = self._handler(request)
-        except Exception as handler_error:  # noqa: BLE001 — anything in the handler is a 500
+        except Exception as handler_error:  # noqa: BLE001 - anything in the handler is a 500
             response = _build_error_response(500, str(handler_error))
-        if not isinstance(response, Response):
-            response = _build_error_response(
-                500,
-                f"handler returned {type(response).__name__}, expected Response",
-            )
-        self._response_bytes = encode_response(response)
+        if isinstance(response, Response):
+            self._stage_response(response)
+            return
+        if getattr(response, "source", None) is not None:
+            # Duck type: a ``StreamingResponse`` (from the opt-in
+            # ``chumicro_http_server.streaming`` submodule) carries a byte
+            # ``source``.  Recognized without importing its class, so a
+            # server that never streams never loads the framing bytecode.
+            # Send the headers, then drain the source across ticks.
+            self._stage_streaming_response(response)
+            return
+        response = _build_error_response(
+            500,
+            f"handler returned {type(response).__name__}, expected Response",
+        )
+        self._stage_response(response)
+
+    def _stage_response(self, response):
+        """Serialize *response* and transition to WANT_SEND_HEADERS.
+
+        Single seam between any code path that resolves a Response
+        (handler dispatch, oversize-body short-circuit) and the send
+        half of the tick.
+        """
+        try:
+            self._response_bytes = encode_response(response)
+        except Exception:  # noqa: BLE001 - an unencodable Response is a 500, not a crash
+            # A handler-built Response with a str body, or a non-ASCII
+            # header / reason, makes encode_response raise.  Without this
+            # the exception escapes tick() and handle() every tick, the
+            # connection never advances, and the handler re-runs forever.
+            # Fall back to the canned 500 (pre-encoded, cannot re-fail).
+            self._response_bytes = _ENCODED_500_ERROR
         self._response_view = memoryview(self._response_bytes)
         self._response_offset = 0
         self.state = _ConnState.WANT_SEND_HEADERS
+
+    def _stage_streaming_response(self, response):
+        """Encode a streaming response's headers + arm the source drain.
+
+        Thin stub: the framing machine lives in the opt-in
+        :mod:`chumicro_http_server.streaming` submodule and loads lazily
+        here, so only a server that actually streams pays its bytecode.
+        """
+        from chumicro_http_server.streaming import (  # noqa: PLC0415
+            stage_streaming_response,
+        )
+        stage_streaming_response(self, response)
 
     def _drive_send(self):
         total = len(self._response_bytes)
@@ -365,7 +489,7 @@ class _Connection:
             try:
                 sent = self._socket.send(chunk)
             except OSError as socket_error:
-                if _is_eagain(socket_error):
+                if socket_error.errno == errno.EAGAIN:
                     return
                 raise
             if sent <= 0:  # pragma: no cover - non-blocking-EAGAIN backpressure path
@@ -373,28 +497,45 @@ class _Connection:
             self._response_offset += sent
             consumed += sent
         if self._response_offset >= total:
-            self.state = _ConnState.DONE
+            # A streaming response hands off to the body drain; a buffered
+            # response (``_stream is None``) is complete — byte-identical
+            # to the pre-streaming path.
+            if self._stream is not None:
+                self.state = _ConnState.WANT_SEND_BODY
+            else:
+                self.state = _ConnState.DONE
+
+    def _drive_stream_body(self):
+        """Drain the byte source to the socket for one tick (thin stub).
+
+        The drain loop — per-tick send budget, EAGAIN backpressure, chunk
+        framing, and mid-body failure handling — lives in the opt-in
+        :mod:`chumicro_http_server.streaming` submodule, lazy-loaded here.
+        """
+        from chumicro_http_server.streaming import (  # noqa: PLC0415
+            drive_stream_body,
+        )
+        drive_stream_body(self)
 
     def _fail(self):
         self.state = _ConnState.ERROR
-
-    def _emit_error_response(self, status_code: int, message: str) -> None:
-        """Stage a pre-built error response for the send half of the tick.
-
-        Used for failure modes that have a sensible HTTP-level reply
-        (e.g. 413 from :class:`ServerOversizedError`).  After this,
-        ``handle()`` keeps ticking the connection through send + DONE.
-        """
-        response = _build_error_response(status_code, message)
-        self._response_bytes = encode_response(response)
-        self._response_view = memoryview(self._response_bytes)
-        self._response_offset = 0
-        self.state = _ConnState.WANT_SEND_HEADERS
 
 
 # ---------------------------------------------------------------------------
 # Response encoding
 # ---------------------------------------------------------------------------
+
+
+def _reject_control_chars(label: str, value: str) -> None:
+    """Raise ``ServerProtocolError`` if *value* holds CR, LF, or NUL.
+
+    Guards the response encoder against handler-reflected response
+    splitting: a handler that echoes request-derived data into a header
+    or the reason phrase could otherwise inject CR/LF to splice extra
+    headers or a body into the response.
+    """
+    if "\r" in value or "\n" in value or "\x00" in value:
+        raise ServerProtocolError(f"{label} contains a control character")
 
 
 def encode_response(response: Response) -> bytes:
@@ -404,7 +545,13 @@ def encode_response(response: Response) -> bytes:
     close`` — keep-alive is not supported, so every response closes
     its connection — then emits the status line + headers + body in
     one bytes blob.
+
+    Raises :class:`ServerProtocolError` when the reason phrase or any
+    header name or value carries a CR, LF, or NUL — the control
+    characters a handler reflecting request data could use to splice
+    the response.
     """
+    _reject_control_chars("reason", str(response.reason))
     headers = CaseInsensitiveDict()
     headers["Content-Length"] = str(len(response.body))
     headers["Connection"] = "close"
@@ -413,6 +560,8 @@ def encode_response(response: Response) -> bytes:
         f"HTTP/1.1 {response.status_code} {response.reason}\r\n".encode("ascii"),
     ]
     for name, value in headers.items():
+        _reject_control_chars("header name", str(name))
+        _reject_control_chars("header value", str(value))
         parts.append(f"{name}: {value}\r\n".encode("ascii"))
     parts.append(CRLF)
     parts.append(response.body)
@@ -424,8 +573,8 @@ def _build_error_response(status_code: int, message: str) -> Response:
 
     Used for handler exceptions + handler-returned-non-Response + 404
     fallthrough — all surface through the same path.  Kept module-level
-    so callers + tests can mint canonical errors without going through
-    HttpServer.
+    so callers and tests can build error responses without an HttpServer
+    instance.
     """
     body = message.encode("utf-8")
     headers = CaseInsensitiveDict()
@@ -464,7 +613,7 @@ def _build_method_not_allowed_response(allowed_methods) -> Response:
 class HttpServer:
     """Non-blocking HTTP/1.1 server.
 
-    Construct with a *listener_factory*, then either:
+    Construct with a *transport_factory*, then either:
 
     * Register handlers via the :meth:`route` decorator
       (``@server.route("/path", methods=["GET", "POST"])``), or
@@ -490,21 +639,23 @@ class HttpServer:
         handler: object | None = None,
         radio: object | None = None,
         ssl_context: object | None = None,
-        listener_factory: object | None = None,
+        transport_factory: object | None = None,
     ) -> "HttpServer":
         """Build an :class:`HttpServer` from runtime config.
 
         Reads optional ``http_server.*`` keys (``bind_host`` /
         ``bind_port`` / ``max_connections`` / ``request_timeout_ms`` /
-        ``max_request_body_bytes`` / ``tls.cert_path`` /
-        ``tls.key_path``) from *config*.  All defaults apply when
-        absent; a custom *listener_factory* bypasses the auto-build
+        ``max_request_body_bytes`` / ``max_request_line_bytes`` /
+        ``max_headers_bytes`` / ``stream_buffer_size`` /
+        ``tls.cert_path`` / ``tls.key_path``)
+        from *config*.  All defaults apply when
+        absent; a custom *transport_factory* bypasses the auto-build
         entirely, *ssl_context* opts into TLS without config paths,
         and exactly one half of the TLS pair raises
         :class:`chumicro_config.MissingConfigKey`.
         """
-        if listener_factory is None:
-            # Lazy import so users who pass their own listener_factory
+        if transport_factory is None:
+            # Lazy import so users who pass their own transport_factory
             # don't pull chumicro_sockets into the deploy graph.  See
             # ``chumicro_http_server.sockets_factory`` for the helper itself.
             try:
@@ -515,15 +666,15 @@ class HttpServer:
                 raise RuntimeError(
                     "chumicro_http_server.sockets_factory not "
                     "available (excluded via __chumicro_skip_factories__ "
-                    "or not on the board) — pass listener_factory= "
+                    "or not on the board) — pass transport_factory= "
                     "explicitly.",
                 ) from exception
 
-            listener_factory = chumicro_sockets_factory(
+            transport_factory = chumicro_sockets_factory(
                 config, radio=radio, ssl_context=ssl_context,
             )
         return cls(
-            listener_factory=listener_factory,
+            transport_factory=transport_factory,
             handler=handler,
             max_connections=config.get(
                 "http_server.max_connections", DEFAULT_MAX_CONNECTIONS,
@@ -536,26 +687,41 @@ class HttpServer:
                 "http_server.max_request_body_bytes",
                 DEFAULT_MAX_REQUEST_BODY_BYTES,
             ),
+            max_request_line_bytes=config.get(
+                "http_server.max_request_line_bytes",
+                DEFAULT_MAX_REQUEST_LINE_BYTES,
+            ),
+            max_headers_bytes=config.get(
+                "http_server.max_headers_bytes",
+                DEFAULT_MAX_HEADERS_BYTES,
+            ),
+            stream_buffer_size=config.get(
+                "http_server.stream_buffer_size",
+                DEFAULT_STREAM_BUFFER_SIZE,
+            ),
         )
 
     def __init__(
         self,
         *,
-        listener_factory: object,
+        transport_factory: object,
         handler: object | None = None,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         request_timeout_ms: int = DEFAULT_REQUEST_TIMEOUT_MS,
         recv_budget_per_tick: int = DEFAULT_RECV_BUDGET_PER_TICK,
         send_budget_per_tick: int = DEFAULT_SEND_BUDGET_PER_TICK,
         max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
+        max_request_line_bytes: int = DEFAULT_MAX_REQUEST_LINE_BYTES,
+        max_headers_bytes: int = DEFAULT_MAX_HEADERS_BYTES,
+        stream_buffer_size: int = DEFAULT_STREAM_BUFFER_SIZE,
         ticks: object | None = None,
     ) -> None:
         """Wire up the server.
 
         Args:
-            listener_factory: Callable ``() -> ListeningSocket`` that
+            transport_factory: Callable ``() -> ListeningSocket`` that
                 opens a non-blocking listener (typically
-                ``lambda: tcp_listening_socket(host, port,
+                ``lambda: listener(host, port,
                 radio=wifi.radio)``).  Invoked once on the first
                 :meth:`handle` call.
             handler: Optional fallback callable
@@ -570,27 +736,52 @@ class HttpServer:
                 that hasn't reached ``DONE`` is dropped + the socket
                 is closed.
             recv_budget_per_tick: Per-connection recv cap per
-                :meth:`handle` call.  Bounds tick latency.
+                :meth:`handle` call.  The recv scratch is 512 B, so a
+                larger budget drains in up to ``budget // 512``
+                recv-and-feed iterations per tick against a fast peer —
+                raising it trades tick latency for throughput.  Keep it
+                small so concurrent connections and runner tasks keep
+                getting CPU time within the per-tick budget.
             send_budget_per_tick: Per-connection send cap per
                 :meth:`handle` call.  Higher than recv because
                 response bodies are typically small + we want them
                 drained in one tick when possible.
             max_request_body_bytes: Cap on a single buffered request
                 body.  Default 16 KB.  Bigger bodies are rejected
-                with 400.
+                with 413 Payload Too Large at headers-complete time,
+                before any body bytes are allocated.
+            max_request_line_bytes: Cap on the request-line length
+                (method + target + version).  Default 1 KB.  A request
+                line that reaches the cap without a CRLF is rejected
+                with 414 URI Too Long — bounds the buffer a no-CRLF
+                dribble can grow before the request-timeout deadline.
+            max_headers_bytes: Cap on the total header-section bytes.
+                Default 4 KB.  Headers exceeding the cap are rejected
+                with 431 Request Header Fields Too Large — bounds the
+                buffer a slow header dribble can grow.
+            stream_buffer_size: Staging-window size, in bytes, for a
+                :class:`StreamingResponse` (default 1 KB).  Minted lazily
+                (only a connection that streams allocates one) and reused,
+                so it is the whole per-stream heap cost regardless of body
+                size or a stalled client.  A larger window amortizes the
+                per-send and chunk-framing overhead at the cost of RAM per
+                concurrent stream.
             ticks: Optional tick source — any object exposing
                 ``ticks_ms``, ``ticks_diff``, ``ticks_add`` (matches
                 the ``chumicro_timing.ticks`` submodule shape).
                 Defaults to that submodule (real clock); tests pass
                 ``FakeTicks`` from ``chumicro_timing.testing``.
         """
-        self._listener_factory = listener_factory
+        self._transport_factory = transport_factory
         self._fallback_handler = handler
         self._max_connections = max_connections
         self._request_timeout_ms = request_timeout_ms
         self._recv_budget_per_tick = recv_budget_per_tick
         self._send_budget_per_tick = send_budget_per_tick
         self._max_request_body_bytes = max_request_body_bytes
+        self._max_request_line_bytes = max_request_line_bytes
+        self._max_headers_bytes = max_headers_bytes
+        self._stream_buffer_size = stream_buffer_size
 
         if ticks is None:
             from chumicro_timing import ticks  # noqa: PLC0415 - DI fallback
@@ -598,9 +789,13 @@ class HttpServer:
 
         self._listener = None
         self._connections = []
+        #: Count of accept-time errors swallowed as connection-scoped
+        #: (TLS handshake failures, mid-handshake resets) plus the last
+        #: one, for observability without crashing the server loop.
+        self.accept_errors = 0
+        self.last_accept_error = None
 
-        # Routing tables — two-dict router lifted from tinyweb's
-        # pattern.
+        # Two-dict router.
         # _explicit_routes: (method, path) -> handler.  No path
         # parameters.  O(1) lookup.
         # _pattern_routes: list of (method, prefix, param_name, handler)
@@ -629,7 +824,7 @@ class HttpServer:
           segment populates ``request.path_params["id"]``.
 
         Multi-parameter routes (``"/users/<uid>/posts/<pid>"``) are
-        not supported — file an issue if you hit the limit.
+        not supported.
 
         Args:
             path: Route path, optionally containing a single ``<name>``
@@ -654,8 +849,7 @@ class HttpServer:
 
         Detects ``<name>``-style trailing parameters and routes to the
         pattern dict; everything else lands in the explicit dict.
-        Re-registering the same (method, path) overrides — last-wins,
-        same as Flask / FastAPI.
+        Re-registering the same (method, path) is last-write-wins.
         """
         last_slash = path.rfind("/")
         last_segment = path[last_slash + 1:] if last_slash != -1 else path
@@ -706,16 +900,14 @@ class HttpServer:
         if explicit_handler is not None:
             return explicit_handler(request)
 
-        # 2. Pattern match.  prefix is the path up to + including the
-        # last ``/``; the trailing segment is the parameter value.
-        last_slash = path.rfind("/")
-        if last_slash != -1:
-            prefix = path[:last_slash + 1]
-            param_value = path[last_slash + 1:]
+        # 2. Pattern match — prefix is the path up to + including the
+        # last "/"; the trailing segment is the candidate parameter value.
+        prefix, param_value = _split_pattern_path(path)
+        if param_value:
             for entry_method, entry_prefix, param_name, handler_func in (
                 self._pattern_routes
             ):
-                if entry_method == method and entry_prefix == prefix and param_value:
+                if entry_method == method and entry_prefix == prefix:
                     request.path_params[param_name] = param_value
                     return handler_func(request)
 
@@ -737,14 +929,11 @@ class HttpServer:
         for entry_method, entry_path in self._explicit_routes:
             if entry_path == path:
                 allowed.add(entry_method)
-        last_slash = path.rfind("/")
-        if last_slash != -1:
-            prefix = path[:last_slash + 1]
-            param_value = path[last_slash + 1:]
-            if param_value:
-                for entry_method, entry_prefix, _, _ in self._pattern_routes:
-                    if entry_prefix == prefix:
-                        allowed.add(entry_method)
+        prefix, param_value = _split_pattern_path(path)
+        if param_value:
+            for entry_method, entry_prefix, _, _ in self._pattern_routes:
+                if entry_prefix == prefix:
+                    allowed.add(entry_method)
         return allowed
 
     # ------------------------------------------------------------------
@@ -773,7 +962,7 @@ class HttpServer:
         if self._listener is not None:
             try:
                 self._listener.close()
-            except OSError:  # pragma: no cover — defensive
+            except OSError:  # pragma: no cover - defensive
                 pass
             self._listener = None
 
@@ -781,39 +970,105 @@ class HttpServer:
     # Runner contract
     # ------------------------------------------------------------------
 
-    def check(self, now_ms):  # noqa: ARG002 — runner contract
+    def check(self, now_ms):  # noqa: ARG002 - runner contract
         """Always ``True``: the accept loop must run on every tick.
 
-        Mirrors :class:`chumicro_websockets.WebSocketServer.check` —
-        cheap to advance even with no in-flight connections, and the
+        Cheap to advance even with no in-flight connections, and the
         listener may have a pending accept at any moment.
         """
         return True
 
+    # ------------------------------------------------------------------
+    # Runner I/O interest (read by ``Runner.wait``)
+    # ------------------------------------------------------------------
+    #
+    # HttpServer has more than one socket (the listener plus N in-flight
+    # connections), but the runner contract registers a single socket
+    # per service.  Pragmatic split: expose the listener as ``io_socket``
+    # so the loop wakes on accept-readiness; in-flight connection sends
+    # drain on the periodic ``handle()`` tick rather than via per-
+    # connection poll registration.  Per-connection deadlines feed
+    # ``next_deadline`` so the loop still wakes for request-timeout
+    # enforcement on a quiet listener.
+
+    @property
+    def io_socket(self):
+        """The listener socket-ish object once opened (``handle()``
+        lazy-opens it on first tick), else ``None``.
+
+        Returns :attr:`_listener` as-is; the runner unwraps any ``.sock``
+        adapter wrapper to the registrable pollable at the poller.
+        """
+        if self._listener is None:
+            return None
+        return self._listener
+
+    def io_interest(self, now_ms):  # noqa: ARG002 (runner contract)
+        """Poll-interest bitmask for ``Runner.wait``: the listener wants read
+        (accept-readiness) whenever open, never write (in-flight connection
+        sends drain on the periodic ``handle()`` tick, not via poll)."""
+        return _IO_READ if self._listener is not None else 0
+
+    def next_deadline(self, now_ms):
+        """Earliest tick at which ``handle()`` must run.
+
+        ``None`` when no connection is in flight, so ``Runner.wait``
+        parks on the listener socket until an accept arrives.  While a
+        connection IS in flight, its socket is not in the runner's poll
+        set (the runner registers only the listener), so this caps the
+        wait at a short progress interval — otherwise ``Runner.wait``
+        would sleep to the far request-timeout deadline and the bytes
+        already waiting on the connection socket would stall unread until
+        that deadline killed the connection.
+        """
+        ticks_diff = self._ticks.ticks_diff
+        nearest = None
+        for connection in self._connections:
+            candidate = connection._deadline_ticks
+            if nearest is None or ticks_diff(candidate, nearest) < 0:
+                nearest = candidate
+        if not self._connections:
+            return nearest
+        progress = self._ticks.ticks_add(now_ms, _CONNECTION_PROGRESS_INTERVAL_MS)
+        if nearest is None or ticks_diff(progress, nearest) < 0:
+            return progress
+        return nearest
+
     def handle(self, now_ms):
         """One tick of progress: lazy-open listener, accept, advance conns."""
         if self._listener is None:
-            self._listener = self._listener_factory()
+            self._listener = self._transport_factory()
             _force_non_blocking(self._listener)
         # Try to accept up to one new connection per tick.
         if len(self._connections) < self._max_connections:
             self._try_accept(now_ms)
-        # Advance every in-flight connection.  Iterate over a copy so
-        # connections can finish + be removed during the loop.
-        for connection in list(self._connections):
-            connection.tick(now_ms, ticks_diff_func=self._ticks.ticks_diff)
-            if connection.is_done:
-                connection.close()
-                self._connections.remove(connection)
+        # Advance every in-flight connection.  Guard the copy so an idle
+        # listener (the common case) doesn't allocate a fresh list every
+        # tick; iterate over a copy when non-empty so connections can
+        # finish + be removed during the loop.
+        if self._connections:
+            for connection in list(self._connections):
+                connection.tick(now_ms, ticks_diff_func=self._ticks.ticks_diff)
+                if connection.is_done:
+                    connection.close()
+                    self._connections.remove(connection)
 
     def _try_accept(self, now_ms):
         """Best-effort accept of one pending connection."""
         try:
             accept_result = self._listener.accept()
         except OSError as accept_error:
-            if _is_eagain(accept_error):
+            if accept_error.errno == errno.EAGAIN:
                 return
-            raise
+            # Any other accept-time error is connection-scoped, not
+            # fatal to the server: a TLS listener runs the handshake
+            # synchronously inside accept(), so one client speaking
+            # plaintext / offering a bad cert / resetting mid-handshake
+            # raises here (SSLError, ECONNABORTED).  Record it and keep
+            # the listener alive rather than tearing down the whole loop.
+            self.accept_errors += 1
+            self.last_accept_error = accept_error
+            return
         if accept_result is None:
             return
         client_socket, peer = accept_result
@@ -827,39 +1082,15 @@ class HttpServer:
             recv_budget=self._recv_budget_per_tick,
             send_budget=self._send_budget_per_tick,
             max_request_body_bytes=self._max_request_body_bytes,
+            max_request_line_bytes=self._max_request_line_bytes,
+            max_headers_bytes=self._max_headers_bytes,
+            stream_buffer_size=self._stream_buffer_size,
         )
         self._connections.append(connection)
 
-    # ------------------------------------------------------------------
-    # Response builder
-    # ------------------------------------------------------------------
-
-    def respond(
-        self,
-        status: int = 200,
-        *,
-        body: bytes | str | None = None,
-        json: object | None = None,
-        text: str | None = None,
-        html: str | None = None,
-        headers: object | None = None,
-    ) -> Response:
-        """Build a :class:`Response` with sensible defaults.
-
-        Pass at most one of *body* / *json* / *text* / *html*.  *text*
-        defaults ``Content-Type: text/plain; charset=utf-8``; *html*
-        defaults ``text/html; charset=utf-8``; *json* runs ``json.dumps``
-        + sets ``application/json``.  Caller-supplied *headers* always
-        override these defaults.
-        """
-        return build_response(
-            status, body=body, json=json, text=text, html=html, headers=headers,
-        )
-
-
 # ---------------------------------------------------------------------------
-# Module-level response builder (so handlers can build responses without
-# needing a server reference — useful for tests and helper functions).
+# Module-level response builder.  Handlers + tests build responses without
+# needing a server reference.
 # ---------------------------------------------------------------------------
 
 
@@ -867,15 +1098,18 @@ def build_response(
     status: int = 200,
     *,
     body: bytes | str | None = None,
-    json=None,  # noqa: A002 — json is the conventional kwarg name
+    json=None,  # noqa: A002 - json is the conventional kwarg name
     text: str | None = None,
     html: str | None = None,
     headers: object | None = None,
 ) -> Response:
-    """Build a :class:`Response` — same surface as :meth:`HttpServer.respond`.
+    """Build a :class:`Response` with sensible defaults.
 
-    Exposed at module level so handlers + tests can build responses
-    without a server reference.
+    Pass at most one of *body* / *json* / *text* / *html*.  *text*
+    defaults ``Content-Type: text/plain; charset=utf-8``; *html*
+    defaults ``text/html; charset=utf-8``; *json* runs ``json.dumps``
+    + sets ``application/json``.  Caller-supplied *headers* always
+    override these defaults.
     """
     body_count = sum(
         candidate is not None for candidate in (body, json, text, html)

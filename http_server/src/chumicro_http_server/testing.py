@@ -5,30 +5,28 @@ pre-baked HTTP/1.1 request bytes:
 
 - :class:`FakeListener` — listener stub that hands out queued
   :class:`~chumicro_sockets.testing.FakeSocket` instances on
-  ``accept()``.  Raises ``OSError(11, "would block")`` when the
-  queue is empty so the server's EAGAIN path runs unchanged.
+  ``accept()``.  Raises ``OSError(errno.EAGAIN, "would block")`` when
+  the queue is empty so the server's EAGAIN path runs unchanged.
 - :func:`request_bytes` — build a raw HTTP/1.1 request byte string
   (start line + optional ``Content-Length`` + extra headers + body).
-
-Mirrors the structure of :mod:`chumicro_deploy.testing` and
-:mod:`chumicro_workspace.testing`.
 """
 
-#: Test-support: PyPI sdist / wheel only — bundles and product /
-#: app / functional device deploys exclude it; the on-device unit
-#: sweep is the one path that stages it.
 __chumicro_test_support__ = True
 
 
-class FakeListener:
-    """Listener stub that hands out queued sockets on ``accept()``.
+import errno
 
-    Construct with a list of pre-loaded
-    :class:`~chumicro_sockets.testing.FakeSocket` instances.  Each
-    ``accept()`` call pops the next socket; an empty queue raises
-    ``OSError(11, "would block")`` matching the EAGAIN shape the real
-    listener uses so the server's would-block handling exercises
-    unchanged.
+
+class FakeListener:
+    """Listener stub that hands out queued connections on ``accept()``.
+
+    Construct with a list of ``(FakeSocket, peer)`` tuples — the same
+    ``(socket, address)`` shape a real ``accept()`` returns, which the
+    server unpacks.  Each ``accept()`` call pops the next tuple; an empty
+    queue raises ``OSError(errno.EAGAIN, "would block")`` matching the
+    EAGAIN shape the real listener uses on this host (``11`` on Linux /
+    MP / CP, ``35`` on macOS CPython) so the server's would-block
+    handling exercises unchanged.
     """
 
     def __init__(self, connections):
@@ -37,7 +35,7 @@ class FakeListener:
 
     def accept(self):
         if not self._queue:
-            raise OSError(11, "would block")
+            raise OSError(errno.EAGAIN, "would block")
         return self._queue.pop(0)
 
     def close(self):

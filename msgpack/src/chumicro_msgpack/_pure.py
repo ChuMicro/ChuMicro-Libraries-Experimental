@@ -1,9 +1,8 @@
 """Pure-Python msgpack encoder/decoder.
 
-Used by all runtimes when the native ``msgpack`` C module isn't
-available — `__init__.py` handles dispatch.  Supports None, bool,
-int (32-bit), float (32-bit), str, bytes, bytearray, list, tuple,
-and dict.
+Selected when the native ``msgpack`` C module is not available.
+Supports None, bool, int (32-bit), float (32-bit), str, bytes,
+bytearray, list, tuple, and dict.
 """
 
 import struct
@@ -22,19 +21,25 @@ _ZERO4 = b"\x00\x00\x00\x00"
 def _append_packed(buffer: bytearray, fmt: str, value: object, zero: bytes) -> None:
     """Append ``struct.pack(fmt, value)`` to *buffer* without allocating intermediate bytes.
 
-    ``struct.pack`` returns a fresh ``bytes`` object per call; ``pack_into``
-    writes into a pre-extended slice instead.  Bench-validated to halve
-    per-call heap allocation on MicroPython 1.26 unix-port (64 vs 128 bytes
-    per pack).  *zero* is a module-level zero-byte literal of the right
-    size for *fmt*.
+    ``struct.pack`` returns a fresh ``bytes`` object per call. ``pack_into``
+    writes into a pre-extended slice instead. *zero* is a module-level
+    zero-byte literal of the right size for *fmt*.
     """
     offset = len(buffer)
     buffer.extend(zero)
     struct.pack_into(fmt, buffer, offset, value)
 
 
-def _encode(obj: object, buffer: bytearray) -> None:
-    """Append the msgpack encoding of *obj* to *buffer*."""
+def _encode(obj: object, buffer: bytearray, depth: int = 0) -> None:
+    """Append the msgpack encoding of *obj* to *buffer*.
+
+    *depth* mirrors the decoder's recursion counter so the encoder
+    refuses nesting the decoder would later reject.  Without this guard
+    ``packb`` accepts data ``unpackb`` cannot read back, and a store
+    that persisted it loses it silently on the next load.
+    """
+    if depth > _MAX_DEPTH:
+        raise ValueError("msgpack nesting too deep")
     if obj is True:
         buffer.append(0xc3)
     elif obj is False:
@@ -51,9 +56,9 @@ def _encode(obj: object, buffer: bytearray) -> None:
     elif isinstance(obj, (bytes, bytearray)):
         _encode_bin(obj, buffer)
     elif isinstance(obj, (list, tuple)):
-        _encode_array(obj, buffer)
+        _encode_array(obj, buffer, depth)
     elif isinstance(obj, dict):
-        _encode_map(obj, buffer)
+        _encode_map(obj, buffer, depth)
     else:
         raise TypeError(f"unsupported type: {type(obj).__name__}")
 
@@ -117,7 +122,7 @@ def _encode_bin(value: bytes | bytearray, buffer: bytearray) -> None:
     buffer.extend(value)
 
 
-def _encode_array(value: list | tuple, buffer: bytearray) -> None:
+def _encode_array(value: list | tuple, buffer: bytearray, depth: int) -> None:
     """Append *value* to *buffer* as a msgpack array."""
     length = len(value)
     if length <= 15:
@@ -128,10 +133,10 @@ def _encode_array(value: list | tuple, buffer: bytearray) -> None:
     else:
         raise OverflowError(f"array too long for msgpack: {length} elements")
     for item in value:
-        _encode(item, buffer)
+        _encode(item, buffer, depth + 1)
 
 
-def _encode_map(value: dict, buffer: bytearray) -> None:
+def _encode_map(value: dict, buffer: bytearray, depth: int) -> None:
     """Append *value* to *buffer* as a msgpack map."""
     length = len(value)
     if length <= 15:
@@ -142,55 +147,40 @@ def _encode_map(value: dict, buffer: bytearray) -> None:
     else:
         raise OverflowError(f"map too long for msgpack: {length} entries")
     for key, val in value.items():
-        _encode(key, buffer)
-        _encode(val, buffer)
+        _encode(key, buffer, depth + 1)
+        _encode(val, buffer, depth + 1)
 
 
 # ---------------------------------------------------------------------------
 # Decoding
 # ---------------------------------------------------------------------------
 
-# Tag bytes that are valid msgpack but outside the chumicro 32-bit /
-# 16-bit subset.  Decoding one points the producer at the fix instead
-# of saying "unsupported byte".
-_OUT_OF_SUBSET = {
-    0xcb: ("float64", "encode with msgpack.packb(obj, use_single_float=True)"),
-    0xcf: ("uint64", "keep integers in [-2**31, 2**32-1]"),
-    0xd3: ("int64", "keep integers in [-2**31, 2**32-1]"),
-    0xc6: ("bin32", "bytes payloads must be under 65 536 bytes"),
-    0xdb: ("str32", "strings must be under 65 536 bytes"),
-    0xdd: ("array32", "arrays must be under 65 536 elements"),
-    0xdf: ("map32", "maps must be under 65 536 entries"),
-}
-
-# Trusting-decoder bounds.  unpackb is hardened against malformed
-# *framing* — truncation, over-length, trailing bytes, unbounded
-# nesting — but is not a per-type spec validator; a
-# structurally-valid payload of the wrong shape is the caller's
-# contract.  Nesting deeper than _MAX_DEPTH raises rather than
-# exhausting the interpreter stack on a 256 KB board.  The bound is
-# bench-set, not analytical: a Pi Pico W under MicroPython faults
-# (pystack exhausted) at 17 nested containers and survives 16, so the
-# guard must trip well below that on the smallest supported board.  8
-# fires the guard ~18 frames deep — comfortably under the measured
-# ~32-frame ceiling, with headroom for caller frames — while still
-# being 2x any realistic persisted config / kvstore payload (those
-# nest 2–4 deep).  struct-prefixed reads need no check here:
-# MicroPython/CircuitPython struct.unpack_from already raises
-# ValueError("buffer too small") on a short buffer, so only the
-# slice-based str/bin reads (memoryview slicing truncates silently)
-# and the container loops need an explicit length guard.
+# Cap on decoder recursion depth. A Pi Pico W under MicroPython
+# exhausts pystack at 17 nested containers, so the guard has to trip
+# well below that on the smallest supported board. 8 leaves room for
+# realistic persisted config / kvstore payloads (which nest 2-4 deep)
+# while staying safely under the stack ceiling.
 _MAX_DEPTH = 8
 _MALFORMED = "malformed msgpack: truncated or over-length framing"
+
+# A truncated multi-byte header reads past the buffer.  ``data[offset+1]``
+# raises IndexError on every runtime; ``struct.unpack_from`` on a short
+# buffer raises struct.error on CPython but ValueError on MicroPython /
+# CircuitPython, which expose no ``struct.error`` attribute.  The tuple is
+# built to match only the types that exist so unpackb can translate the
+# CPython case to the ValueError the contract promises; the MP / CP
+# ValueError already satisfies it.
+_FRAMING_ERRORS = (IndexError,)
+if hasattr(struct, "error"):
+    _FRAMING_ERRORS = (IndexError, struct.error)
 
 
 def _bounded_end(data: memoryview, start: int, length: int) -> int:
     """Return ``start + length``, or raise if it runs past *data*.
 
     A ``memoryview`` slice silently truncates instead of erroring, so
-    without this an over-length claimed length returns a short result
-    rather than failing — the length-vs-remaining check that keeps the
-    decoder safe against truncated / over-length framing.
+    without this an over-length claim returns a short read rather than
+    failing.
     """
     end = start + length
     if end > len(data):
@@ -303,18 +293,39 @@ def _decode(data: memoryview, offset: int, depth: int) -> tuple:
     if byte >= 0xe0:
         return byte - 256, offset + 1
 
-    out_of_subset = _OUT_OF_SUBSET.get(byte)
-    if out_of_subset is not None:
-        name, fix = out_of_subset
-        raise ValueError(f"{name} (0x{byte:02x}) not in chumicro msgpack subset; {fix}")
+    raise _unsupported_byte_error(byte)
 
-    raise ValueError(f"unsupported msgpack type byte: 0x{byte:02x}")
+
+def _unsupported_byte_error(byte: int) -> ValueError:
+    """Return the ValueError for a *byte* no decode branch matched.
+
+    A byte that is valid msgpack but outside the chumicro 32-bit /
+    16-bit subset gets a message naming the tag and the producer-side
+    fix; anything else gets the plain "unsupported byte".  The
+    tag-to-guidance table lives here rather than at module scope so it
+    costs no import-time RAM on the healthy path that never decodes an
+    out-of-subset byte.
+    """
+    out_of_subset = {
+        0xcb: ("float64", "encode with msgpack.packb(obj, use_single_float=True)"),
+        0xcf: ("uint64", "keep integers in [-2**31, 2**32-1]"),
+        0xd3: ("int64", "keep integers in [-2**31, 2**32-1]"),
+        0xc6: ("bin32", "bytes payloads must be under 65 536 bytes"),
+        0xdb: ("str32", "strings must be under 65 536 bytes"),
+        0xdd: ("array32", "arrays must be under 65 536 elements"),
+        0xdf: ("map32", "maps must be under 65 536 entries"),
+    }
+    guidance = out_of_subset.get(byte)
+    if guidance is not None:
+        name, fix = guidance
+        return ValueError(f"{name} (0x{byte:02x}) not in chumicro msgpack subset; {fix}")
+    return ValueError(f"unsupported msgpack type byte: 0x{byte:02x}")
 
 
 def _decode_array(data: memoryview, offset: int, length: int, depth: int) -> tuple:
     """Decode *length* array elements starting at *offset*; return ``(list, new_offset)``."""
     # Every element is at least one byte, so a claimed length past the
-    # remaining buffer is malformed framing — reject before the loop
+    # remaining buffer is malformed framing. Reject before the loop
     # allocates a giant list from corrupt input.
     if length > len(data) - offset:
         raise ValueError(_MALFORMED)
@@ -327,15 +338,22 @@ def _decode_array(data: memoryview, offset: int, length: int, depth: int) -> tup
 
 def _decode_map(data: memoryview, offset: int, length: int, depth: int) -> tuple:
     """Decode *length* map key/value pairs starting at *offset*; return ``(dict, new_offset)``."""
-    # Each pair is at least two bytes; the one-byte-per-entry lower
-    # bound is a safe conservative reject (never false-positives on
-    # valid data) that stops an unbounded loop on corrupt input.
+    # Each pair is at least two bytes, so a claimed length past the
+    # remaining buffer (using the conservative 1-byte-per-entry bound)
+    # is malformed framing. Reject before the loop allocates from
+    # corrupt input.
     if length > len(data) - offset:
         raise ValueError(_MALFORMED)
     result = {}
     for _ in range(length):
         key, offset = _decode(data, offset, depth + 1)
         value, offset = _decode(data, offset, depth + 1)
+        # A map key that decoded to a container is structurally valid
+        # msgpack but unusable as a dict key; surface it as the
+        # documented ValueError rather than letting the raw TypeError
+        # from result[key] escape the untrusted-input contract.
+        if isinstance(key, (list, dict)):
+            raise ValueError("msgpack map key is not hashable")
         result[key] = value
     return result, offset
 
@@ -348,9 +366,11 @@ def packb(obj: object) -> bytes:
     """Pack *obj* to msgpack bytes.
 
     Allocates a temporary ``bytearray`` that grows during encoding,
-    then copies to ``bytes``.  For small payloads this is fine; for
-    larger data or tight loops, prefer ``pack(obj, stream)`` to write
-    directly to a destination without the intermediate allocation.
+    then copies to ``bytes``.  On this pure-Python path ``pack(obj,
+    stream)`` does not avoid that allocation — it calls ``packb`` and
+    writes the result — so there is no allocation reason to prefer it
+    here; the no-intermediate-buffer property holds only on the native
+    CircuitPython encoder.
 
     Args:
         obj: Python object to serialize.
@@ -367,13 +387,19 @@ def unpackb(data: bytes | bytearray | memoryview) -> object:
     """Unpack msgpack *data* to a Python object.
 
     This is a *trusting* decoder, not a spec validator.  It is safe
-    against malformed framing — truncated, over-length, or
+    against malformed framing (truncated, over-length, or
     trailing-garbage input, and unbounded nesting, all raise
-    ``ValueError`` rather than returning a silently-wrong result — but
-    it does not check that a structurally-valid payload has the type
+    ``ValueError`` rather than returning a silently-wrong result).
+    It does not check that a structurally-valid payload has the type
     shape the caller expects.  Code persisting corruption- or
     attacker-reachable bytes (e.g. flash-backed config) still owns
-    type-shape validation of what comes back.
+    type-shape validation of what comes back.  It also owns a size
+    bound on attacker-controlled input: an array / map element count
+    is checked only against the remaining buffer, so an N-byte payload
+    can allocate an N-element container (roughly 8N bytes of pointers
+    on a 256 KB board).  Do not ``unpackb`` an unbounded peer-supplied
+    blob — an MQTT payload, an HTTP body — without first bounding its
+    length.
 
     Args:
         data: Msgpack-encoded data.
@@ -388,8 +414,12 @@ def unpackb(data: bytes | bytearray | memoryview) -> object:
     """
     if not isinstance(data, memoryview):
         data = memoryview(data)
-    result, end = _decode(data, 0, 0)
-    # Trailing bytes are rejected at the top level only — the recursive
+    try:
+        result, end = _decode(data, 0, 0)
+    except _FRAMING_ERRORS as framing_error:
+        # A truncated multi-byte length header read past the buffer end.
+        raise ValueError(_MALFORMED) from framing_error
+    # Trailing bytes are rejected at the top level only. The recursive
     # core legitimately stops mid-buffer inside a container.
     if end != len(data):
         raise ValueError("trailing bytes after msgpack value")
@@ -399,12 +429,14 @@ def unpackb(data: bytes | bytearray | memoryview) -> object:
 # ---------------------------------------------------------------------------
 # Public API — stream-based
 # ---------------------------------------------------------------------------
-# On CircuitPython with the native ``msgpack`` C module, ``__init__.py``
-# imports ``pack`` / ``unpack`` from it directly and never reaches this
-# file — so the definitions below are always the pure-Python ones.
 
 def pack(obj: object, stream: object) -> None:
     """Pack *obj* to *stream* in msgpack format.
+
+    On this pure-Python path the whole object is encoded to a ``bytes``
+    first and then written in one call, so it allocates the same as
+    ``packb`` (plus the write); it is not the lower-allocation option
+    the native encoder makes it.
 
     Args:
         obj: Python object to serialize.
@@ -414,12 +446,25 @@ def pack(obj: object, stream: object) -> None:
 
 
 def unpack(stream: object) -> object:
-    """Unpack one object from *stream*.
+    """Unpack a single object from *stream*.
+
+    On this pure-Python path the ENTIRE stream is read and decoded as
+    exactly one object: trailing bytes past the first object raise
+    ``ValueError``, and the read consumes everything (so it can't unpack
+    one object from a multi-object or still-open stream, and blocks on a
+    live socket until close).  The native CircuitPython decoder instead
+    reads incrementally and leaves the rest in the stream — so a
+    multi-record stream only works on the native path.  For framed or
+    multi-object data, drive :func:`unpackb` over an explicitly-bounded
+    slice instead.
 
     Args:
         stream: Readable stream with a ``read()`` method.
 
     Returns:
         Deserialized Python object.
+
+    Raises:
+        ValueError: Truncated framing, or bytes past the first object.
     """
     return unpackb(stream.read())

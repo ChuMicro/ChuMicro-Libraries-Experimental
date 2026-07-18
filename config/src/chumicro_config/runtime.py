@@ -1,11 +1,13 @@
 """On-device reader for ``/runtime_config.msgpack`` (flat dotted-key shape)."""
 
+import errno
+
 from chumicro_msgpack import unpackb
 
 from chumicro_config.section import InvalidConfigType, RuntimeConfig
 
 DEFAULT_RUNTIME_CONFIG_PATH = "/runtime_config.msgpack"
-"""Canonical on-device location — changing this is an ABI break."""
+"""Default on-device location. Changing this is an ABI break."""
 
 
 def load_runtime_config(path: str | None = None) -> RuntimeConfig:
@@ -13,9 +15,10 @@ def load_runtime_config(path: str | None = None) -> RuntimeConfig:
 
     Raises ``OSError`` if the file is missing, :class:`InvalidConfigType`
     if the payload isn't a dict or is malformed msgpack (e.g. a
-    power-loss-truncated file — ``unpackb`` rejects bad framing).
-    *path* defaults to :data:`DEFAULT_RUNTIME_CONFIG_PATH` at call time
-    (resolved late so tests can monkey-patch the constant).
+    power-loss-truncated file, which ``unpackb`` rejects as bad framing).
+    *path* defaults to :data:`DEFAULT_RUNTIME_CONFIG_PATH`, read from the
+    module constant at call time so that one documented ABI value stays
+    the single source of the on-device location.
     """
     if path is None:
         path = DEFAULT_RUNTIME_CONFIG_PATH
@@ -42,7 +45,13 @@ def _ensure_config_loaded() -> RuntimeConfig | None:
     if not _config_loaded:
         try:
             _config_cache = load_runtime_config()
-        except OSError:
+        except OSError as error:
+            # Only a genuinely-absent file means "no config" (None).  A
+            # real I/O failure (EIO / EACCES / a wedged filesystem) is
+            # not the same as absent and must not be silently masked;
+            # re-raise it.  errno is args[0] on every runtime.
+            if error.args and error.args[0] != errno.ENOENT:
+                raise
             _config_cache = None
         _config_loaded = True
     return _config_cache
@@ -50,7 +59,7 @@ def _ensure_config_loaded() -> RuntimeConfig | None:
 
 def __getattr__(name: str):
     # `InvalidConfigType` (file present but malformed) is intentionally
-    # not caught here — corruption is a hard deploy failure, surfaced
+    # not caught here. Corruption is a hard deploy failure, surfaced
     # loudly rather than silently masked as `config = None`.
     if name == "config":
         return _ensure_config_loaded()

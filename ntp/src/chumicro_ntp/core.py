@@ -11,19 +11,17 @@ them should use a full NTP implementation (out of scope for embedded).
 Wire format reference: RFC 4330 §4.
 """
 
+import errno
+
 try:
     from micropython import const
 except ImportError:
     def const(value):
         return value
 
-def _is_eagain(error):
-    return getattr(error, "errno", None) in (11, 35)
-
 
 #: Seconds between the NTP epoch (1900-01-01T00:00:00Z) and the
-#: Unix epoch (1970-01-01T00:00:00Z).  Constant since both epochs
-#: are fixed.
+#: Unix epoch (1970-01-01T00:00:00Z).
 NTP_TO_UNIX = const(2208988800)
 
 #: SNTP packet length in bytes.  Fixed by the protocol — every
@@ -35,8 +33,8 @@ PACKET_SIZE = const(48)
 CLIENT_FIRST_BYTE = const(0x23)
 
 #: First byte of an SNTP **response** has Mode=4 (server) in the
-#: low three bits.  Tests check the mode rather than the whole
-#: byte because some servers echo VN!=4.
+#: low three bits.  Match against the low three bits only — some
+#: servers echo VN!=4.
 SERVER_MODE = const(4)
 
 #: The complete 48-byte SNTP client request — first byte is
@@ -44,6 +42,15 @@ SERVER_MODE = const(4)
 #: Identical for every query, so we send the same object instead of
 #: rebuilding a fresh packet each call.
 _CLIENT_REQUEST = bytes([CLIENT_FIRST_BYTE]) + b"\x00" * (PACKET_SIZE - 1)
+
+#: Errnos that mean "no datagram ready yet", not a failed exchange.  A
+#: non-blocking socket reports EAGAIN on every runtime; CPython on macOS
+#: reports the distinct EWOULDBLOCK (errno 35).  MicroPython /
+#: CircuitPython expose no EWOULDBLOCK and alias it to EAGAIN on device,
+#: so the tuple holds only what each runtime defines.
+_WOULD_BLOCK_ERRNOS = (errno.EAGAIN,)
+if hasattr(errno, "EWOULDBLOCK"):
+    _WOULD_BLOCK_ERRNOS = (errno.EAGAIN, errno.EWOULDBLOCK)
 
 
 class NTPError(OSError):
@@ -92,6 +99,12 @@ def _parse_response(packet: bytes | memoryview) -> int:
         | (packet[42] << 8)
         | packet[43]
     )
+    if seconds_1900 == 0:
+        # RFC 4330 §5: a zero transmit timestamp is invalid and must be
+        # discarded.  Without this the era heuristic below would "lift"
+        # it to a bogus 2036-02-07 reading and hand back a valid-looking
+        # wrong time.
+        raise NTPError("SNTP zero transmit timestamp")
     # NTP era 0 ends 2036-02-07 when the 32-bit field wraps.  A value
     # below the 1900->1970 offset must be era 1; lift it by 2**32.
     # Heuristic holds until ~2106, then the hard upper bound.
@@ -124,8 +137,10 @@ class NTPResult:
         """Server's transmit timestamp converted to Unix-epoch seconds.
 
         Raises:
-            NTPError: The exchange ended in failure — read
-                :attr:`error` for the underlying exception.
+            Exception: Re-raises the stored :attr:`error` when the
+                exchange failed — an :class:`NTPError` for a protocol,
+                timeout, or cancellation failure, or the raw ``OSError``
+                from a failed send / recv.
             RuntimeError: The exchange has not finished yet.
         """
         if not self.done:
@@ -144,9 +159,8 @@ class NTPClient:
     """Runner-shaped SNTP client over an injected UDP socket.
 
     Single in-flight request at a time — calling :meth:`query` while
-    :attr:`busy` is ``True`` raises ``RuntimeError`` (mirrors
-    ``HttpClient.busy``).  Apps wanting parallel queries instantiate
-    multiple clients on distinct sockets.
+    :attr:`busy` is ``True`` raises ``RuntimeError``.  Apps wanting
+    parallel queries instantiate multiple clients on distinct sockets.
 
     The socket is **not owned** by the client — caller passes it in
     and is responsible for closing it.  The ``sockets_factory``
@@ -160,10 +174,10 @@ class NTPClient:
     Args:
         socket: A non-blocking UDP-shaped object.  Must expose:
 
-            * ``sendto(payload: bytes, address) -> int`` — sends the
-              packet to *address* (a ``(host, port)`` tuple).
-              Raises ``OSError(EAGAIN | EWOULDBLOCK)`` when the send
-              buffer is full.
+            * ``sendto(payload: bytes, host: str, port: int) -> int`` —
+              sends the packet to ``(host, port)``.  Raises
+              ``OSError(EAGAIN | EWOULDBLOCK)`` when the send buffer is
+              full.
             * ``recvfrom_into(buffer) -> (nbytes, address)`` — reads
               into *buffer*, returning the byte count and sender.
               Raises ``OSError(EAGAIN | EWOULDBLOCK)`` on no data.
@@ -171,9 +185,11 @@ class NTPClient:
             * ``setblocking(flag: bool) -> None`` — best-effort;
               absence is tolerated.
 
-            :func:`chumicro_sockets.udp_socket` is one valid
-            producer; stdlib ``socket.socket(SOCK_DGRAM)`` after
-            ``setblocking(False)`` is another.  Tests inject
+            :func:`chumicro_sockets.udp_socket` is the valid producer.
+            A raw stdlib ``socket.socket(SOCK_DGRAM)`` does **not** fit:
+            its ``sendto`` takes ``(data, address)``, not the separated
+            ``(data, host, port)`` this contract calls, so wrap it in a
+            3-line adapter if you must bring your own.  Tests inject
             :class:`chumicro_sockets.testing.FakeUDPSocket`.
         server: NTP server hostname.  Defaults to ``"pool.ntp.org"``.
             Resolution is delegated to the runtime's name resolver.
@@ -197,39 +213,40 @@ class NTPClient:
         *,
         radio: object | None = None,
         socket: object | None = None,
-        socket_factory: object | None = None,
+        transport_factory: object | None = None,
     ) -> "NTPClient":
         """Build an :class:`NTPClient` from runtime config.
 
         Reads optional ``ntp.server`` / ``ntp.port`` / ``ntp.timeout_ms``
         — empty ``config`` is valid input (defaults to ``pool.ntp.org``
-        on port 123).  A *socket* or *socket_factory* override bypasses
-        the auto-built UDP factory; the auto path sets the socket
-        non-blocking before passing it to the client.
+        on port 123).  A *socket* or *transport_factory* override bypasses
+        the auto-built UDP factory; the auto path defers the open to
+        the first ``query()`` and sets the socket non-blocking.
         """
-        if socket is None:
-            if socket_factory is None:
-                try:
-                    from chumicro_ntp.sockets_factory import (  # noqa: PLC0415
-                        chumicro_sockets_factory,
-                    )
-                except ImportError as exception:
-                    raise RuntimeError(
-                        "chumicro_ntp.sockets_factory not available "
-                        "(excluded via __chumicro_skip_factories__ or "
-                        "not on the board) — pass socket= or "
-                        "socket_factory= explicitly.",
-                    ) from exception
+        if socket is None and transport_factory is None:
+            try:
+                from chumicro_ntp.sockets_factory import (  # noqa: PLC0415
+                    chumicro_sockets_factory,
+                )
+            except ImportError as exception:
+                raise RuntimeError(
+                    "chumicro_ntp.sockets_factory not available "
+                    "(excluded via __chumicro_skip_factories__ or "
+                    "not on the board) — pass socket= or "
+                    "transport_factory= explicitly.",
+                ) from exception
 
-                socket = chumicro_sockets_factory(radio=radio)
-                # Runner-shaped clients require non-blocking recv.  Guarded so
-                # test fakes without setblocking() still work.
-                if hasattr(socket, "setblocking"):
-                    socket.setblocking(False)
-            else:
-                socket = socket_factory()
+            def transport_factory():
+                # Deferred: the UDP socket opens on the first query(),
+                # not at construction — building a client is free.
+                udp_socket = chumicro_sockets_factory(radio=radio)
+                # Runner-shaped clients require non-blocking recv.
+                udp_socket.setblocking(False)
+                return udp_socket
+
         return cls(
             socket=socket,
+            transport_factory=transport_factory,
             server=config.get("ntp.server", "pool.ntp.org"),
             port=config.get("ntp.port", 123),
             timeout_ms=config.get("ntp.timeout_ms", 5_000),
@@ -237,8 +254,9 @@ class NTPClient:
 
     def __init__(
         self,
-        socket: object,
+        socket: object | None = None,
         *,
+        transport_factory: object | None = None,
         server: str = "pool.ntp.org",
         port: int = 123,
         timeout_ms: int = 5_000,
@@ -246,7 +264,13 @@ class NTPClient:
     ) -> None:
         if timeout_ms <= 0:
             raise ValueError("timeout_ms must be positive")
+        if (socket is None) == (transport_factory is None):
+            raise ValueError(
+                "provide exactly one of socket= or transport_factory= "
+                "(the factory defers the UDP open to the first query)"
+            )
         self.socket = socket
+        self._transport_factory = transport_factory
         self.server = server
         self.port = port
         self.timeout_ms = timeout_ms
@@ -255,8 +279,7 @@ class NTPClient:
         self._ticks = ticks
         self._result: NTPResult | None = None
         # Pre-allocate the receive buffer so the hot path doesn't
-        # allocate.  48 bytes is the SNTP packet size; larger buffers
-        # would just hold tail bytes nobody wants.
+        # allocate.  48 bytes is the SNTP packet size.
         self._recv_buffer = bytearray(PACKET_SIZE)
 
     @property
@@ -267,6 +290,8 @@ class NTPClient:
     def query(self) -> NTPResult:
         """Issue a single SNTP query.
 
+        Opens the UDP socket on first use when the client was built
+        with *transport_factory* (construction is side-effect-free).
         Sends the 48-byte client request immediately, then arms the
         runner-shaped recv path.  Subsequent ticks of
         ``check`` / ``handle`` drain the response from the socket.
@@ -274,14 +299,25 @@ class NTPClient:
         Returns:
             An :class:`NTPResult` the caller polls.
 
+        A synchronous ``sendto`` failure is not raised — it is delivered
+        on the returned result (``result.error`` is the ``OSError`` and
+        the result is already ``done``).
+
         Raises:
             RuntimeError: A query is already in flight (``busy``).
-            OSError: The synchronous ``sendto`` call failed.
         """
         if self.busy:
             raise RuntimeError(
                 "NTP query already in flight; await result before re-querying",
             )
+        if self.socket is None:
+            self.socket = self._transport_factory()
+        # Discard any datagrams already buffered from a previous
+        # (timed-out or cancelled) exchange before sending.  Without
+        # this, a late reply to an old request sits in the socket buffer
+        # and the next handle() accepts it as the answer to this query —
+        # silently setting the clock from a stale timestamp.
+        self._drain_socket()
         now_ms = self._ticks.ticks_ms()
         result = NTPResult(ticks_started_ms=now_ms)
         try:
@@ -292,6 +328,23 @@ class NTPClient:
             return result
         self._result = result
         return result
+
+    def _drain_socket(self) -> None:
+        """Discard any datagrams already buffered on the socket.
+
+        Best-effort: reads into the shared recv buffer and drops each
+        datagram until ``recvfrom_into`` reports would-block (or any
+        other error), leaving the socket empty for a fresh exchange.
+        """
+        while True:
+            try:
+                received_count, _sender = self.socket.recvfrom_into(
+                    self._recv_buffer,
+                )
+            except OSError:
+                return  # would-block / no more data buffered
+            if received_count == 0:
+                return
 
     def check(self, now_ms: int) -> bool:
         """Return ``True`` when the runner should call :meth:`handle`.
@@ -322,7 +375,7 @@ class NTPClient:
                 self._recv_buffer,
             )
         except OSError as recv_error:
-            if _is_eagain(recv_error):
+            if recv_error.errno in _WOULD_BLOCK_ERRNOS:
                 # No data this tick.  Check the timeout instead.
                 self._check_timeout(result, now_ms)
                 return

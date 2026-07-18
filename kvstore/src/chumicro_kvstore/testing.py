@@ -1,7 +1,7 @@
 """Test helpers for libraries that depend on ``chumicro-kvstore``.
 
-Downstream consumers import ``FakeKVStore`` rather than inventing
-ad-hoc mocks.
+``FakeKVStore`` is here for downstream libraries to test against
+instead of hand-rolling a store mock.
 
 Example::
 
@@ -13,9 +13,6 @@ Example::
     store.simulate_corrupt()                 # force is_corrupt next load
 """
 
-#: Test-support: PyPI sdist / wheel only -- bundles and product /
-#: app / functional device deploys exclude it; the on-device unit
-#: sweep is the one path that stages it.
 __chumicro_test_support__ = True
 
 from chumicro_kvstore._backends.memory import MemoryBackend
@@ -98,9 +95,13 @@ class FakeKVStore(KVStore):
         """Adjust the simulated capacity mid-test.
 
         Lets tests cross the ``KVStoreFull`` threshold deterministically
-        without manufacturing a giant payload.
+        without manufacturing a giant payload.  Updates both the backend
+        and the ``KVStore.capacity`` snapshot taken at construction, so
+        raising the cap mid-test actually takes effect (the store's own
+        pre-check reads its snapshot, not the backend).
         """
         self._memory_backend.capacity = capacity
+        self.capacity = capacity
 
     @property
     def raw_payload(self) -> bytes:

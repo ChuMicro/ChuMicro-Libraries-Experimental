@@ -8,6 +8,8 @@ call, so an LED keeps blinking through the opening handshake, frame
 I/O, control-frame interleave, and the close handshake.
 """
 
+import gc
+
 from chumicro_websockets._wire import (
     CLOSE_BAD_DATA,
     CLOSE_GOING_AWAY,
@@ -33,10 +35,43 @@ from chumicro_websockets._wire import (
     make_websocket_key,
     parse_ws_url,
 )
-from chumicro_websockets.client import WebSocketClient, WhenOversized
-from chumicro_websockets.server import Connection, WebSocketServer
+
+gc.collect()
+
+from chumicro_websockets._session import InboundMessage, WhenOversized  # noqa: E402, I001 - preceded by gc.collect().
+
+gc.collect()
+
+
+def __getattr__(name):
+    """Lazy-load the client / server halves on first access (PEP 562).
+
+    ``client`` and ``server`` are ~20 KB of source each.  A client-only
+    app — the common Pico W case — never touches ``WebSocketServer`` /
+    ``Connection``, and a server-only app never touches
+    ``WebSocketClient``, so importing both eagerly would pin the unused
+    half's compiled code objects in RAM.  Deferring each until its first
+    attribute access keeps only the half a deployment uses resident.
+    """
+    if name == "WebSocketClient":
+        from chumicro_websockets.client import WebSocketClient  # noqa: PLC0415
+
+        return WebSocketClient
+    if name == "Connection":
+        from chumicro_websockets.server import Connection  # noqa: PLC0415
+
+        return Connection
+    if name == "WebSocketServer":
+        from chumicro_websockets.server import WebSocketServer  # noqa: PLC0415
+
+        return WebSocketServer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
+    # pyright: ignore[reportUnsupportedDunderAll] — Connection,
+    # WebSocketClient, and WebSocketServer are PEP-562 lazy via
+    # __getattr__.
     "CLOSE_BAD_DATA",
     "CLOSE_GOING_AWAY",
     "CLOSE_INTERNAL_ERROR",
@@ -50,6 +85,7 @@ __all__ = [
     "OPCODE_PONG",
     "OPCODE_TEXT",
     "Connection",
+    "InboundMessage",
     "WebSocketBackpressureError",
     "WebSocketClient",
     "WebSocketError",
@@ -65,3 +101,5 @@ __all__ = [
     "make_websocket_key",
     "parse_ws_url",
 ]
+
+gc.collect()
