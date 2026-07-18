@@ -1,9 +1,4 @@
-"""Default :mod:`chumicro_sockets` wiring for :class:`MQTTClient`.
-
-Opt-in: the package's ``__init__.py`` does not import this submodule,
-so users who pass their own ``socket`` or ``transport_factory`` never
-pull :mod:`chumicro_sockets` into the deploy graph.
-"""
+"""Default :mod:`chumicro_sockets` wiring for :class:`MQTTClient`."""
 
 from chumicro_config import MissingConfigKey
 
@@ -11,16 +6,11 @@ from chumicro_config import MissingConfigKey
 def chumicro_sockets_connector_factory(config, *, radio=None, ssl_context=None):
     """Build a ``() -> SocketConnector`` factory from *config*.
 
-    Reads ``mqtt.broker.host`` / ``mqtt.broker.port``.  Both are
-    required so the library never silently dials a third-party broker.
-    Routes through :func:`chumicro_sockets.connector` with ``tls=True``
-    when *ssl_context* is supplied.  Missing keys raise
-    :class:`chumicro_config.MissingConfigKey`.
+    Returns:
+        A zero-arg callable returning a fresh non-blocking connector.
 
-    The returned callable is what ``MQTTClient(transport_factory=...)``
-    expects: each invocation hands back a fresh non-blocking connector
-    in ``"awaiting_dns"``.  :class:`MQTTClient` drives it across ticks
-    so the runner is not blocked for the DNS / TCP / TLS round-trip.
+    Raises:
+        MissingConfigKey: A required broker key is missing.
     """
     for required_key in ("mqtt.broker.host", "mqtt.broker.port"):
         if required_key not in config:

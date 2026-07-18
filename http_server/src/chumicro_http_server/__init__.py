@@ -1,29 +1,10 @@
 """Non-blocking HTTP/1.1 server for CircuitPython, MicroPython, and CPython.
 
-Built on :mod:`chumicro_sockets` (TCP listener + accepted client
-sockets) and :mod:`chumicro_timing` (ticks).  Tick-based runner
-contract — :meth:`HttpServer.check(now_ms)` reports whether work is
-pending and :meth:`handle(now_ms)` does one slice of progress per
-call, so an LED can keep blinking on the same board even through a
-slow upload or stalled client.
-
-Not supported: HTTP/1.1 keep-alive or connection pooling (every
-response carries ``Connection: close``); chunked request bodies
-(use ``Content-Length``); WebSockets, sessions / cookies / auth
-helpers, multipart upload, sub-app mounting, async handlers.
+The entry point is :class:`HttpServer`.
 """
 
 import gc
 
-# Streamed response bodies are an opt-in submodule
-# (``chumicro_http_server.streaming`` — ``StreamingResponse`` /
-# ``build_streaming_response`` / ``encode_streaming_headers``), NOT
-# re-exported here: the base ``HttpServer`` recognizes a streaming
-# response by duck type and lazy-loads the framing machine only to drive
-# one, so a server that never streams never pays its bytecode.  The two
-# constants below live in ``_wire`` (always imported) so the streaming
-# submodule and the constructor default share them without pulling the
-# framing code in.
 from chumicro_http_server._wire import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_HEADERS_BYTES,
@@ -52,18 +33,9 @@ gc.collect()
 
 
 def __getattr__(name):
-    """Lazy-load the server half on first access (PEP 562).
-
-    ``server`` is ~22 KB of source.  A board that imports
-    ``chumicro_http_server`` for its wire helpers (request parsing,
-    header dict, query/target splitting) but never builds an
-    ``HttpServer`` shouldn't pin the server's compiled code objects in
-    RAM; the module loads on the first access to one of its
-    symbols.  Constructing the server at startup keeps that one-time
-    import cost on a fresh heap (see the guide).
-    """
+    # Lazy PEP 562 import: a wire-only board never loads the server module.
     if name in ("HttpServer", "Request", "Response", "build_response", "encode_response"):
-        # Sweep before the big compile (see chumicro_mqtt.__getattr__).
+        # Free the heap before the large import compiles.
         gc.collect()
         import chumicro_http_server.server as _server  # noqa: PLC0415
 
@@ -72,7 +44,7 @@ def __getattr__(name):
 
 
 __all__ = [
-    # pyright: ignore[reportUnsupportedDunderAll] — HttpServer, Request,
+    # pyright: ignore[reportUnsupportedDunderAll]: HttpServer, Request,
     # Response, build_response, and encode_response are PEP-562 lazy via
     # __getattr__.
     "DEFAULT_MAX_CONNECTIONS",

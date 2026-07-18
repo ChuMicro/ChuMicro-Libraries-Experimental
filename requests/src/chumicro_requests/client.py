@@ -1,32 +1,6 @@
 """HTTP/1.1 client built on chumicro-sockets + chumicro-timing.
 
-:class:`HttpClient` is the entry point.  Runner-shaped —
-:meth:`check(now_ms) -> bool` reports whether work is pending;
-:meth:`handle(now_ms)` performs one tick of progress.  No threads,
-no async — cooperative dispatch in the caller's tick loop.
-
-Single-in-flight in v1: :meth:`HttpClient.get` / ``post`` / etc.
-while a request is still running raises :class:`HttpBusyError`.  The
-user pattern::
-
-    client = HttpClient(transport_factory=...)
-    handle = client.get("http://api.example.com/now", timeout_ms=5000)
-
-    while not handle.done:
-        if client.check(now_ms()):
-            client.handle(now_ms())
-
-    response = handle.result   # raises on failure
-
-This module ships GET / POST / PUT / PATCH / DELETE over HTTP and
-HTTPS (an ``https://`` URL selects TLS), JSON request bodies via
-``json=...``, automatic 3xx redirect following (capped, and
-method-preserving where the status requires it), and response
-bodies via ``Content-Length``, ``Transfer-Encoding: chunked``, or
-read-until-close — buffered whole by default, or streamed
-incrementally into a caller-owned buffer with ``stream=True``
-(``handle.read_body_into``), so a body larger than the heap is
-consumable at a fixed RAM cost.
+:class:`HttpClient` is the entry point.
 """
 
 import errno
@@ -54,65 +28,40 @@ from chumicro_requests._wire import (
     resolve_redirect_url,
 )
 
-# Poll-interest bits for ``io_interest``; mirror ``chumicro_runner.IO_READ``
-# / ``IO_WRITE`` by value.  Held as literals rather than imported so the
-# requests client runs without importing the runner (bring-your-own-scheduler).
+# Mirror chumicro_runner's IO_READ / IO_WRITE by value, as literals so
+# the client needs no runner import.
 _IO_READ = 1
 _IO_WRITE = 2
 
-# EWOULDBLOCK is absent from MicroPython's errno; fall back to EAGAIN
-# (they're the same value on the platforms that define both).
+# EWOULDBLOCK is absent from MicroPython's errno; fall back to EAGAIN.
 _EWOULDBLOCK = getattr(errno, "EWOULDBLOCK", errno.EAGAIN)
 
 
 def _is_would_block(socket_error):
-    """Return whether *socket_error* means "no progress yet, retry later".
-
-    A non-blocking plain socket raises ``OSError(EAGAIN | EWOULDBLOCK)``.
-    A non-blocking ``ssl.SSLSocket`` on CPython instead raises
-    ``SSLWantReadError`` / ``SSLWantWriteError`` (``OSError`` subclasses
-    whose ``errno`` is ``SSL_ERROR_WANT_READ`` / ``WANT_WRITE``, not
-    EAGAIN), so treating only EAGAIN as would-block turned every HTTPS
-    request into a fatal error.  Matched by exception-class name to stay
-    dependency-free across runtimes (the MicroPython / CircuitPython TLS
-    adapters already normalize to EAGAIN, so the name never matches
-    there).
-    """
     if socket_error.errno in (errno.EAGAIN, _EWOULDBLOCK):
         return True
+    # CPython's non-blocking SSLSocket raises SSLWantRead/WriteError, not
+    # EAGAIN; match by class name. MicroPython TLS normalizes to EAGAIN.
     return type(socket_error).__name__ in (
         "SSLWantReadError",
         "SSLWantWriteError",
     )
 
 
-# ---------------------------------------------------------------------------
-# WhenOversized policy
-# ---------------------------------------------------------------------------
-
-
 class WhenOversized:
     """Policy for response bodies exceeding ``max_body_bytes``."""
 
-    #: Drop the body silently.  The request finishes as ``done`` with
-    #: an empty body and the headers intact — useful when callers only
-    #: care about the status code (e.g. liveness checks).
+    #: Drop the body silently; the request finishes ``done`` with an empty body.
     DROP_SILENT = "drop_silent"
 
-    #: Default.  Drop the body, fire ``client.on_oversized(reported_length,
-    #: url)`` if set, otherwise behave like :data:`DROP_SILENT`.
+    #: Default: drop the body and fire ``on_oversized`` if set, else like DROP_SILENT.
     DROP_WITH_EVENT = "drop_with_event"
 
-    #: Fail the request with :class:`HttpOversizedError`.  Use when
-    #: the application can't tolerate truncated payloads.
+    #: Fail the request with :class:`HttpOversizedError`.
     DISCONNECT = "disconnect"
 
 
 def _encode_body(body, json_body):
-    """Convert *body* / *json_body* into ``bytes`` (or ``None``).
-
-    At most one of *body* / *json_body* is non-None (caller validates).
-    """
     if json_body is not None:
         return json.dumps(json_body).encode("utf-8")
     if body is None:
@@ -127,13 +76,6 @@ def _encode_body(body, json_body):
 
 
 def _merge_default_header(user_headers, name, value):
-    """Return a CaseInsensitiveDict with *name=value* applied unless overridden.
-
-    *user_headers* may be ``None``, a ``dict``, a
-    :class:`CaseInsensitiveDict`, or an iterable of ``(name, value)``
-    pairs.  Lets a default like ``Content-Type: application/json``
-    apply only when the caller hasn't supplied that header.
-    """
     merged = CaseInsensitiveDict()
     merged[name] = value
     if user_headers is None:
@@ -150,13 +92,8 @@ def _merge_default_header(user_headers, name, value):
 
 
 def _force_non_blocking(socket):
-    """Best-effort ``setblocking(False)`` on a chumicro-sockets socket.
-
-    The tick-based RX path expects ``recv_into`` to raise EAGAIN when
-    no data is available, never to block.  MicroPython's stdlib
-    socket starts in blocking mode and chumicro_sockets' MP adapter
-    doesn't override that, so we enforce here.
-    """
+    # MicroPython sockets start blocking; the tick RX path needs
+    # recv_into to raise EAGAIN, not block.
     setblocking = getattr(socket, "setblocking", None)
     if setblocking is None:
         return
@@ -166,40 +103,18 @@ def _force_non_blocking(socket):
         pass
 
 
-# ---------------------------------------------------------------------------
-# Response + RequestHandle
-# ---------------------------------------------------------------------------
-
-
 class Response:
     """Result of a completed HTTP request.
-
-    Constructed by the client when the response parser hits ``DONE``;
-    callers read but don't mutate.
 
     Attributes:
         status_code: Integer HTTP status (e.g. ``200``).
         reason: Reason phrase from the status line (e.g. ``"OK"``).
         http_version: Protocol version string (e.g. ``"HTTP/1.1"``).
         headers: :class:`CaseInsensitiveDict` of response headers.
-        body: Raw response body as ``bytes``.  Empty (``b""``) when
-            :attr:`streamed` — the body never materializes; read it
-            through ``RequestHandle.read_body_into``.
+        body: Raw response body as ``bytes``; empty when :attr:`streamed`.
         url: The URL that was requested.
-        oversized_dropped: ``True`` when the body was dropped per
-            ``when_oversized`` policy (``False`` for normal responses).
-        streamed: ``True`` when the request was issued with
-            ``stream=True`` — status / headers are final, the body is
-            consumed incrementally, and :attr:`text` / :meth:`json`
-            refuse rather than decode an empty body.
-
-    Body decoding:
-
-    * :attr:`encoding` — charset sniffed from ``Content-Type``,
-      defaulting to ``"utf-8"``.  Settable so callers can override
-      a wrong / missing server hint.
-    * :attr:`text` — body decoded as a ``str`` using :attr:`encoding`.
-    * :meth:`json` — body parsed as JSON into Python objects.
+        oversized_dropped: ``True`` when the body was dropped per the ``when_oversized`` policy.
+        streamed: ``True`` when issued with ``stream=True``; the body is consumed incrementally.
     """
 
     def __init__(
@@ -234,13 +149,7 @@ class Response:
 
     @property
     def encoding(self) -> str:
-        """Charset used to decode :attr:`body` into :attr:`text`.
-
-        Sniffed from the ``Content-Type`` response header on first
-        access (default ``"utf-8"`` when absent or charset-less).
-        Set the property to override — useful when a server's
-        Content-Type lies or omits the charset.
-        """
+        """Charset used to decode :attr:`body` into :attr:`text`."""
         if self._encoding_override is not None:
             return self._encoding_override
         return parse_charset(self.headers.get("Content-Type"))
@@ -251,13 +160,11 @@ class Response:
 
     @property
     def text(self) -> str:
-        """:attr:`body` decoded using :attr:`encoding`.
+        """:attr:`body` decoded to ``str`` using :attr:`encoding`.
 
-        Raises ``UnicodeError`` if the body bytes don't match
-        the encoding.  Override :attr:`encoding` first if you know
-        the server's Content-Type is wrong.  Raises
-        :class:`HttpError` on a :attr:`streamed` response — the body
-        never materializes, so decoding it whole is not available.
+        Raises:
+            UnicodeError: The body bytes don't match the encoding.
+            HttpError: The response is :attr:`streamed`, so has no whole body.
         """
         if self.streamed:
             raise HttpError(
@@ -269,42 +176,14 @@ class Response:
     def json(self) -> object:
         """Parse :attr:`body` as JSON and return the decoded object.
 
-        Decodes via :attr:`text` first so the JSON parser sees a
-        properly-decoded string (matching CPython ``requests``
-        semantics).  Raises ``ValueError`` (specifically
-        ``json.JSONDecodeError`` on CPython) when the body isn't
-        valid JSON.
+        Raises:
+            ValueError: The body is not valid JSON.
         """
         return json.loads(self.text)
 
 
 class RequestHandle:
-    """Caller-visible handle to an in-flight (or completed) request.
-
-    Returned from :meth:`HttpClient.get`.  Two ways to read the
-    outcome:
-
-    * Poll :attr:`done`; when ``True``, :attr:`result` returns the
-      :class:`Response` (or raises the :class:`HttpError` that killed
-      the request).  :attr:`error` is the same exception, returned
-      instead of raised — useful when the caller wants to branch
-      rather than catch.
-    * Pass ``on_done=`` to the request call.  The client invokes that
-      callback with this handle when the request finishes, success or
-      failure, so the response handling stays bound to the request
-      that produced it instead of polling a shared slot.  The callback
-      fires after the client returns to idle, so it may issue the next
-      request directly.
-
-    :attr:`url` records the requested URL (the original one, not the
-    final redirect target), so a completion callback can tell which
-    request it's handling.
-
-    For a request issued with ``stream=True``, :attr:`response` is set
-    as soon as the final hop's headers are parsed — before :attr:`done`
-    — and the body arrives incrementally through
-    :meth:`read_body_into`.
-    """
+    """Caller-visible handle to an in-flight (or completed) request."""
 
     def __init__(self, *, url, on_done=None, stream=False):
         self.url = url
@@ -313,20 +192,10 @@ class RequestHandle:
         self.error = None
         self._on_done = on_done
         self._stream = stream
-        # Streamed requests: the object serving read_body_into (the
-        # response parser, installed when the final hop's headers are
-        # parsed).  Held here so the staged bytes stay readable after
-        # the client has returned to idle.
         self._body_source = None
 
     def read_body_into(self, buffer):
         """Copy received body bytes into caller-owned *buffer*; return the count.
-
-        For requests issued with ``stream=True`` only.  Returns ``0``
-        when no bytes are staged this tick; once :attr:`done` is
-        ``True`` (with :attr:`error` unset), ``0`` means end of body.
-        On a failed request the bytes staged before the failure remain
-        readable — check :attr:`error` and treat them as partial.
 
         Raises:
             HttpError: The request was not issued with ``stream=True``.
@@ -341,22 +210,10 @@ class RequestHandle:
         return source.read_body_into(buffer)
 
     def _publish_stream(self, response, body_source):
-        """Internal: client calls this at final-hop headers-complete.
-
-        Sets :attr:`response` (leaving :attr:`done` False — the body is
-        still arriving) and installs *body_source*, the object whose
-        ``read_body_into`` serves the staged body bytes.
-        """
         self.response = response
         self._body_source = body_source
 
     def _invoke_done(self):
-        """Fire the completion callback, if one was registered.
-
-        Called by the client once the request has finished and all
-        per-request state has been cleared, so a callback that issues
-        a follow-up request sees an idle client.
-        """
         if self._on_done is not None:
             self._on_done(self)
 
@@ -365,10 +222,7 @@ class RequestHandle:
         """Return the :class:`Response`; raise the failure if any.
 
         Raises:
-            HttpError: The request failed (timeout, protocol error,
-                socket close mid-response, etc.).  Calling ``result``
-                before ``done`` is ``True`` is a programming error
-                and raises :class:`HttpError`.
+            HttpError: The request failed, or ``result`` was read before ``done``.
         """
         if not self.done:
             raise HttpError(
@@ -380,35 +234,15 @@ class RequestHandle:
         return self.response
 
     def _set_response(self, response):
-        """Internal: client calls this on success."""
         self.response = response
         self.done = True
 
     def _set_error(self, error):
-        """Internal: client calls this on failure."""
         self.error = error
         self.done = True
 
 
-# ---------------------------------------------------------------------------
-# HttpClient — runner-shaped, single-in-flight
-# ---------------------------------------------------------------------------
-
-
 class _RequestState:
-    """Internal request-pipeline states.
-
-    Lifecycle for one in-flight request::
-
-        IDLE -> AWAITING_TRANSPORT -> SENDING -> RECEIVING -> IDLE
-
-    ``AWAITING_TRANSPORT`` is the phase during which the connector
-    object returned by *transport_factory* is driving DNS / TCP / TLS
-    across multiple ticks.  On ``ready`` the socket is promoted and the
-    state moves to ``SENDING``.  On ``failed`` the handle is set to
-    error and the state returns to ``IDLE``.
-    """
-
     IDLE = "idle"
     AWAITING_TRANSPORT = "awaiting_transport"
     SENDING = "sending"
@@ -416,44 +250,7 @@ class _RequestState:
 
 
 class HttpClient:
-    """Non-blocking HTTP/1.1 client.
-
-    Construct with a *transport_factory* callable; then issue requests
-    via :meth:`get` and drive via :meth:`check` / :meth:`handle` from a
-    runner tick or hand-rolled loop.
-
-    The factory signature is::
-
-        transport_factory(host: str, port: int, use_tls: bool) -> connector
-
-    The returned *connector* is a structural type: an object with
-    ``state`` / ``socket`` / ``last_error`` attributes, ``tick(now_ms)``
-    / ``cancel()`` methods, and the runner-poll surface ``io_socket`` /
-    ``io_interest(now_ms)`` / ``next_deadline(now_ms)``.
-    Any object of that shape works — the client never imports a specific
-    class.
-
-    For a board with WiFi + chumicro-sockets, use
-    :func:`chumicro_requests.sockets_factory.chumicro_sockets_connector_factory`
-    to wire up the default::
-
-        from chumicro_requests import HttpClient
-        from chumicro_requests.sockets_factory import (
-            chumicro_sockets_connector_factory,
-        )
-        client = HttpClient(
-            transport_factory=chumicro_sockets_connector_factory(),
-        )
-
-    The connector advances the TCP connect across ticks; the DNS lookup
-    and, on MicroPython / CircuitPython, the TLS handshake block the
-    runner for their duration.
-
-    For config-driven construction, see :meth:`from_config` —
-    one-line factory that reads the per-call defaults
-    (``requests.default_timeout_ms``, ``requests.user_agent``,
-    etc.) from ``runtime_config.msgpack``.
-    """
+    """Non-blocking HTTP/1.1 client."""
 
     @classmethod
     def from_config(
@@ -464,27 +261,7 @@ class HttpClient:
         ssl_context: object | None = None,
         transport_factory: object | None = None,
     ) -> "HttpClient":
-        """Build an :class:`HttpClient` from runtime config.
-
-        Reads the ``[tool.chumicro.config]`` keys — all optional with
-        sensible defaults:
-
-        * ``requests.default_timeout_ms`` defaults to
-          :data:`DEFAULT_TIMEOUT_MS` (10 000 ms).
-        * ``requests.default_max_redirects`` defaults to
-          :data:`DEFAULT_MAX_REDIRECTS` (5).
-        * ``requests.user_agent`` defaults to the built-in
-          ``"chumicro-requests/0.1"``.
-        * ``requests.max_body_bytes`` defaults to
-          :data:`DEFAULT_MAX_BODY_BYTES`.
-
-        No key is required; empty ``config`` is valid input.  When
-        *transport_factory* is supplied, the caller owns the
-        connection-opening behavior and *radio* / *ssl_context* are
-        ignored.  Otherwise an auto-built factory wires through
-        :func:`chumicro_sockets_connector_factory` using *radio* /
-        *ssl_context*.
-        """
+        """Build an :class:`HttpClient` from runtime config."""
         if transport_factory is None:
             try:
                 from chumicro_requests.sockets_factory import (  # noqa: PLC0415 - lazy
@@ -494,7 +271,7 @@ class HttpClient:
                 raise RuntimeError(
                     "chumicro_requests.sockets_factory not available "
                     "(excluded via __chumicro_skip_factories__ or "
-                    "not on the board) — pass transport_factory= "
+                    "not on the board): pass transport_factory= "
                     "explicitly.",
                 ) from exception
 
@@ -531,82 +308,21 @@ class HttpClient:
         """Wire up the client.
 
         Args:
-            transport_factory: Callable ``(host: str, port: int,
-                use_tls: bool) -> connector`` invoked per request hop
-                to bring up the underlying socket without blocking the
-                runner.  The connector is a duck-typed object — see
-                the class docstring for the structural contract.  It
-                is ticked across multiple ``handle()`` calls during
-                ``AWAITING_TRANSPORT``; once
-                ``connector.state == "ready"`` the underlying socket is
-                promoted and must expose:
-
-                * ``recv_into(buffer: memoryview, nbytes: int) -> int``
-                  — raises ``OSError(EAGAIN | EWOULDBLOCK)`` on no
-                  data, returns 0 on peer-close, otherwise bytes
-                  written.
-                * ``send(payload: bytes) -> int`` — raises
-                  ``OSError(EAGAIN | EWOULDBLOCK)`` when the send
-                  buffer is full, otherwise bytes sent (may be
-                  partial).
-                * ``close() -> None``
-                * ``setblocking(flag: bool) -> None`` — best-effort;
-                  absence is tolerated.
-
-                :func:`chumicro_sockets_connector_factory` is one
-                valid producer; any zero-network-side fake or wrapper
-                returning a connector-shaped object works too.
-            recv_budget_per_tick: Soft cap on bytes drained from the
-                socket in a single :meth:`handle` call.  Default 1024.
-                The recv scratch is 512 B, so against a fast peer a
-                larger budget drains in up to ``budget // 512``
-                recv-and-feed iterations per tick — raising it trades
-                tick latency for throughput.  Keep it small (a few
-                hundred bytes to a couple KB) so concurrent runner tasks
-                (LED blink, control loop) keep getting CPU time within
-                the per-tick budget.
-            max_body_bytes: Cap on a single response body.  Default
-                64 KB — minimum supported board has 256 KB MCU RAM,
-                so 64 KB leaves headroom.  Not applied to requests
-                issued with ``stream=True``: a streamed body's RAM
-                bound is *stream_buffer_size* plus the caller's own
-                buffer, so the body may be any size.
-            when_oversized: Policy for responses above the cap.  See
-                :class:`WhenOversized`.  Never fires for streamed
-                requests (the cap does not apply there).
-            stream_buffer_size: Staging capacity, in bytes, for each
-                request issued with ``stream=True`` — the most decoded
-                body bytes held while waiting for the caller to drain
-                them via ``RequestHandle.read_body_into``.  Allocated
-                per streamed request (so a finished-but-undrained
-                handle never aliases the next request's staging) and
-                default 1024.  Buffered requests never allocate it.
+            transport_factory: Callable ``(host, port, use_tls)`` opening a socket per hop.
+            recv_budget_per_tick: Soft cap on bytes drained per :meth:`handle` call.
+            max_body_bytes: Cap on a buffered body; not applied to ``stream=True``.
+            when_oversized: Policy for over-cap responses (see :class:`WhenOversized`).
             default_timeout_ms: Default per-request timeout in ms.
-                Overridable per-call via ``timeout_ms=...``.  Default
-                10 000 ms.
-            default_max_redirects: Default cap on 3xx hops the client
-                follows.  When the budget is exhausted the last 3xx
-                response is returned as-is (not an ``HttpError``), same
-                as ``max_redirects=0``.  Overridable per-call via
-                ``max_redirects=...``.
-                ``0`` returns the 3xx response as-is without
-                following.  Default 5.
-            user_agent: Override the default ``User-Agent`` header.
-            ticks: Optional tick source — any object exposing
-                ``ticks_ms``, ``ticks_diff``, ``ticks_add`` (matches
-                the ``chumicro_timing.ticks`` submodule shape).
-                Defaults to that submodule (real clock); tests pass
-                ``FakeTicks`` from ``chumicro_timing.testing``.
+            default_max_redirects: Default cap on 3xx hops; ``0`` returns the 3xx as-is.
+            stream_buffer_size: Staging capacity in bytes for each ``stream=True`` body window.
+            user_agent: Override for the default ``User-Agent`` header.
+            ticks: Optional ``chumicro_timing.ticks``-shaped source; defaults to that submodule.
         """
         self._transport_factory = transport_factory
         self._connector = None
         self._recv_budget_per_tick = recv_budget_per_tick
-        # Pre-allocated recv scratch reused on every tick — _drive_recv
-        # passes a memoryview into this buffer to socket.recv_into
-        # instead of allocating per call.  Capped at 512 B so a
-        # generous recv_budget_per_tick (say 64K) doesn't pin a 64K
-        # resident buffer for what's only ever a sliced-down working
-        # window.
+        # Reused recv scratch, capped at 512 B so a generous
+        # recv_budget_per_tick doesn't pin a large resident buffer.
         self._recv_buffer = bytearray(min(recv_budget_per_tick, 512))
         self._recv_view = memoryview(self._recv_buffer)
         self._max_body_bytes = max_body_bytes
@@ -622,83 +338,45 @@ class HttpClient:
 
         self._state = _RequestState.IDLE
         self._socket = None
-        self._handle = None  # current RequestHandle
-        # Handle whose on_done callback is due to fire.  Set when a
-        # request finishes and drained by _fire_completion after the
-        # per-tick pipeline, so a raising callback surfaces to the
-        # caller's loop instead of into the pipeline's error handling.
+        self._handle = None
+        # Drained by _fire_completion after the pipeline tick, so a raising
+        # callback reaches the caller's loop, not the error handling.
         self._completed_handle = None
         self.url = None
-        self._tx_buffer = b""  # request bytes pending send
+        self._tx_buffer = b""
         self._tx_offset = 0
         self._parser = None
-        # Long-lived body buffer reused across requests.  The parser
-        # is constructed fresh per request, but the body buffer is
-        # the largest per-request alloc; holding it on the client
-        # and passing it to each new parser means a per-request body
-        # allocation happens only when the response would exceed
-        # body_buffer_size.
+        # Reused across requests and passed to each parser, so a per-request
+        # body alloc happens only when a response exceeds body_buffer_size.
         self._body_buffer = bytearray(DEFAULT_BODY_BUFFER_SIZE)
         self._body_buffer_view = memoryview(self._body_buffer)
         self._stream_buffer_size = stream_buffer_size
-        # True while the in-flight request was issued with stream=True.
         self._stream = False
         self._deadline_ticks = None
-        # Per-request redirect bookkeeping — captured at _start_request
-        # so each follow-redirect hop sees the same budget + the
-        # original method/body for 307/308 replay.
+        # Captured at _start_request so each hop sees the same budget and
+        # the original method/body for 307/308 replay.
         self._redirects_remaining = 0
         self._original_method = None
         self._original_headers = None
         self._original_body = None
         self._original_json_body = None
 
-        # Optional event hooks.
         self.on_oversized = lambda *_args, **_kwargs: None
-
-    # ------------------------------------------------------------------
-    # Public observation
-    # ------------------------------------------------------------------
 
     @property
     def busy(self):
         """``True`` while a request is in flight."""
         return self._state != _RequestState.IDLE
 
-    # ------------------------------------------------------------------
-    # Runner I/O interest (read by ``Runner.wait``)
-    # ------------------------------------------------------------------
-
     @property
     def io_socket(self):
-        """Underlying pollable socket while in flight, else ``None``.
-
-        ``Runner.wait`` registers this object with ``select.poll``.
-        While in ``AWAITING_TRANSPORT`` this forwards to the
-        connector's in-flight pollable so the runner parks on the
-        right handle between connect phases.  Once promoted, the
-        socket is returned as-is — the contract is "return your
-        socket-ish object"; the runner unwraps adapter wrappers'
-        ``.sock`` at the poller.
-        """
+        """Underlying pollable socket while in flight, else ``None``."""
         if self._state == _RequestState.AWAITING_TRANSPORT:
             return self._connector.io_socket if self._connector is not None else None
         return self._socket
 
     def io_interest(self, now_ms):
-        """Poll-interest bitmask OR-ing ``_IO_READ`` / ``_IO_WRITE``.
-
-        ``_IO_READ`` while waiting on response bytes from the server,
-        ``_IO_WRITE`` while there are request bytes still to send.
-        During ``AWAITING_TRANSPORT`` the whole connecting-phase
-        interest (including TLS-handshake read/write needs) is the
-        connector's, so forward its mask; ``0`` when idle or with no
-        connector yet.  A streamed request whose staging window is
-        full also reports ``0`` — the socket may be readable but
-        nothing will drain it until the caller reads, so registering
-        read interest would spin the poll loop; ``next_deadline``
-        still wakes the runner for timeout enforcement.
-        """
+        """Poll-interest bitmask OR-ing ``_IO_READ`` / ``_IO_WRITE``."""
         if self._state == _RequestState.AWAITING_TRANSPORT:
             return self._connector.io_interest(now_ms) if self._connector is not None else 0
         if self._state == _RequestState.RECEIVING:
@@ -714,22 +392,7 @@ class HttpClient:
         return 0
 
     def next_deadline(self, now_ms):
-        """Return the per-request timeout deadline, or ``None`` when idle.
-
-        Lets ``Runner.wait`` shorten its central poll so the loop wakes
-        for timeout enforcement even on a quiescent socket.  *now_ms*
-        is the runner's tick and is accepted for the contract; the
-        deadline is an absolute tick captured at request start.
-
-        While ``AWAITING_TRANSPORT`` with no pollable yet (the connector
-        is still resolving DNS, so ``io_socket`` is ``None`` and
-        ``Runner.wait`` has nothing to park on), this returns *now_ms* —
-        an immediate deadline that keeps the loop ticking the
-        tick-driven connector forward instead of sleeping toward the far
-        request deadline.  Once a pollable exists (TCP-connect onward) or
-        the connect phase ends, the per-request budget governs again and
-        still times out a stuck handshake.
-        """
+        """Return the per-request timeout deadline, or ``None`` when idle."""
         if self._state == _RequestState.IDLE:
             return None
         if (
@@ -738,10 +401,6 @@ class HttpClient:
         ):
             return now_ms
         return self._deadline_ticks
-
-    # ------------------------------------------------------------------
-    # Public request API
-    # ------------------------------------------------------------------
 
     def request(
         self,
@@ -756,18 +415,7 @@ class HttpClient:
         on_done: object | None = None,
         stream: bool = False,
     ) -> "RequestHandle":
-        """Issue *method* against *url*; return a :class:`RequestHandle`.
-
-        Generic entry behind the per-verb methods — *method* is sent
-        verbatim, and body / json / redirect / timeout semantics match
-        :meth:`post`.  Pass ``stream=True`` to consume the response
-        body incrementally: ``handle.response`` is set once the final
-        hop's headers are parsed, and the body is read tick by tick
-        via ``handle.read_body_into(buffer)`` (``0`` after
-        ``handle.done`` means end of body).  ``max_body_bytes`` and
-        the ``WhenOversized`` policy do not apply to streamed bodies —
-        the staging window bounds RAM instead.
-        """
+        """Issue *method* against *url*; return a :class:`RequestHandle`."""
         return self._start_request(
             method, url,
             body=body, json_body=json,
@@ -785,17 +433,7 @@ class HttpClient:
         on_done: object | None = None,
         stream: bool = False,
     ) -> "RequestHandle":
-        """Issue a GET request; return a :class:`RequestHandle`.
-
-        Poll ``handle.done``, then read ``handle.result`` for the
-        :class:`Response`.  Alternatively pass ``on_done=callback`` to
-        have the client call ``callback(handle)`` when the request
-        finishes (see :class:`RequestHandle`).  ``max_redirects=0``
-        returns a 3xx as-is.  ``stream=True`` delivers the body
-        incrementally (see :meth:`request`).  Raises
-        :class:`HttpBusyError` if a request is already in flight,
-        :class:`HttpURLError` if *url* doesn't parse.
-        """
+        """Issue a GET request; return a :class:`RequestHandle`."""
         return self._start_request(
             "GET", url, headers=headers, timeout_ms=timeout_ms,
             max_redirects=max_redirects, on_done=on_done, stream=stream,
@@ -813,17 +451,7 @@ class HttpClient:
         on_done: object | None = None,
         stream: bool = False,
     ) -> "RequestHandle":
-        """Issue a POST request; return a :class:`RequestHandle`.
-
-        Pass exactly one of *body* or *json*.  *json* auto-encodes via
-        :func:`json.dumps` and sets ``Content-Type: application/json``
-        unless the caller overrides it via *headers*.  *body* as ``str``
-        is encoded UTF-8.  ``Content-Length`` is auto-added.  Passing
-        both *body* and *json* raises ``ValueError``.  ``on_done`` is the
-        optional completion callback (see :class:`RequestHandle`);
-        ``stream=True`` delivers the response body incrementally (see
-        :meth:`request`).
-        """
+        """Issue a POST request; return a :class:`RequestHandle`."""
         return self._start_request(
             "POST", url,
             body=body, json_body=json,
@@ -843,7 +471,7 @@ class HttpClient:
         on_done: object | None = None,
         stream: bool = False,
     ) -> "RequestHandle":
-        """Issue a PUT request.  Same body / json / stream semantics as :meth:`post`."""
+        """Issue a PUT request; same body / json / stream semantics as :meth:`post`."""
         return self._start_request(
             "PUT", url,
             body=body, json_body=json,
@@ -863,7 +491,7 @@ class HttpClient:
         on_done: object | None = None,
         stream: bool = False,
     ) -> "RequestHandle":
-        """Issue a PATCH request.  Same body / json / stream semantics as :meth:`post`."""
+        """Issue a PATCH request; same body / json / stream semantics as :meth:`post`."""
         return self._start_request(
             "PATCH", url,
             body=body, json_body=json,
@@ -881,66 +509,33 @@ class HttpClient:
         on_done: object | None = None,
         stream: bool = False,
     ) -> "RequestHandle":
-        """Issue a DELETE request.  No body — the verb is intransitive in v1."""
+        """Issue a DELETE request; v1 sends no body."""
         return self._start_request(
             "DELETE", url, headers=headers, timeout_ms=timeout_ms,
             max_redirects=max_redirects, on_done=on_done, stream=stream,
         )
-
-    # ------------------------------------------------------------------
-    # Runner contract
-    # ------------------------------------------------------------------
 
     def check(self, now_ms):  # noqa: ARG002 - runner contract uses now_ms
         """Return ``True`` if there's outbound bytes to send or readable bytes."""
         return self._state != _RequestState.IDLE
 
     def handle(self, now_ms):
-        """One tick of progress on the in-flight request.
-
-        Advances the connector while ``AWAITING_TRANSPORT``, sends
-        queued request bytes, drains inbound bytes (up to
-        ``recv_budget_per_tick``), feeds the parser, and finishes the
-        handle when the response is complete.
-
-        Per-request ``timeout_ms`` is checked at the top of each tick
-        and applies during ``AWAITING_TRANSPORT`` too — a stuck
-        handshake fails the same way a stuck recv would.  On expiry
-        the request fails with :class:`HttpTimeoutError` and the
-        socket / connector is closed.
-        """
+        """One tick of progress on the in-flight request."""
         if self._state == _RequestState.IDLE:
             return
         self._drive_tick(now_ms)
-        # Fire the finished request's on_done callback here, after the
-        # pipeline tick — a callback that raises, or that issues a
-        # follow-up request, must reach the caller's loop rather than be
-        # caught by _drive_tick's HttpError / OSError handlers and
-        # misattributed to whatever request is now in flight.
+        # Fire on_done after the pipeline tick so a raising or re-issuing
+        # callback reaches the caller's loop, not _drive_tick's handlers.
         self._fire_completion()
 
     def cancel(self):
-        """Abort the in-flight request; no-op when idle.
-
-        Closes the socket / connector, fails the handle with
-        :class:`HttpError` (``done`` flips True, ``error`` set), fires
-        its ``on_done`` callback, and returns the client to idle so the
-        next request can be issued immediately.  The exit for a caller
-        that decides mid-response to stop — a streamed download past
-        the caller's own byte ceiling, a screen the user navigated away
-        from — without waiting for ``timeout_ms``.
-        """
+        """Abort the in-flight request; no-op when idle."""
         if self._state == _RequestState.IDLE:
             return
         self._fail(HttpError(f"request to {self.url!r} cancelled"))
         self._fire_completion()
 
     def _drive_tick(self, now_ms):
-        """Run one pipeline tick: timeout check, connector, send, recv.
-
-        Completion callbacks are not fired here; :meth:`handle` fires
-        them after this returns.
-        """
         if self._deadline_ticks is not None and self._ticks.ticks_diff(
             self._deadline_ticks, now_ms,
         ) <= 0:
@@ -953,7 +548,7 @@ class HttpClient:
             if self._state == _RequestState.AWAITING_TRANSPORT:
                 if not self._advance_connector(now_ms):
                     return
-                # Connector reached ``ready`` — fall through and start sending.
+                # Connector ready: fall through to sending this same tick.
             if self._state == _RequestState.SENDING:
                 self._drive_send()
             if self._state == _RequestState.RECEIVING:
@@ -964,27 +559,12 @@ class HttpClient:
             self._fail(HttpError(f"socket error: {socket_error}"))
 
     def _fire_completion(self):
-        """Invoke the finished handle's on_done callback, if one is pending.
-
-        Runs outside the pipeline tick so a callback that raises or
-        issues a follow-up request is not caught by the pipeline's
-        error handling and does not corrupt a newly-started request.
-        """
         finished_handle = self._completed_handle
         self._completed_handle = None
         if finished_handle is not None:
             finished_handle._invoke_done()  # noqa: SLF001 - internal handoff
 
     def _advance_connector(self, now_ms):
-        """Tick the in-flight connector one phase; promote socket when ``ready``.
-
-        Returns ``True`` when the connector reached ``ready`` this tick
-        — in which case the socket is promoted to ``self._socket``,
-        forced non-blocking, and the state moves to ``SENDING``.
-        Returns ``False`` when the connector is still in flight (state
-        unchanged) or has failed (state is now ``IDLE`` with the
-        handle marked errored).
-        """
         connector = self._connector
         connector.tick(now_ms)
         if connector.state == "ready":
@@ -1000,16 +580,11 @@ class HttpClient:
             return False
         return False
 
-    # ------------------------------------------------------------------
-    # Internal — request lifecycle
-    # ------------------------------------------------------------------
-
     def _start_request(
         self, method, url, *, headers, timeout_ms,
         body=None, json_body=None, max_redirects=None, on_done=None,
         stream=False,
     ):
-        """Common path for GET / POST / PUT / PATCH / DELETE."""
         if self._state != _RequestState.IDLE:
             raise HttpBusyError(
                 f"client busy on {self.url!r}; await handle.done before issuing another",
@@ -1023,12 +598,8 @@ class HttpClient:
         self._redirects_remaining = (
             max_redirects if max_redirects is not None else self._default_max_redirects
         )
-        # Capture the user's request shape for 307/308 redirect replay
-        # — method + body + headers + the json-default-content-type
-        # flag rebuild the on-the-wire bytes for the next hop.  The
-        # body copy is retained only when a redirect can actually fire;
-        # with redirects disabled it would pin a duplicate of the whole
-        # body for nothing.
+        # Keep the body for 307/308 replay only when a redirect can fire;
+        # otherwise it would pin a duplicate body for nothing.
         self._original_method = method
         self._original_headers = headers
         self._original_body = encoded_body if self._redirects_remaining > 0 else None
@@ -1042,13 +613,6 @@ class HttpClient:
     def _start_hop(
         self, url, method, encoded_body, user_headers, json_default_content_type,
     ):
-        """Open a socket and queue the request bytes for *url*.
-
-        Reused by both first-issue and redirect-follow paths.  The
-        per-request handle, deadline, and redirect budget are *not*
-        reset here — they belong to the request as a whole, not to
-        any one hop.
-        """
         merged_headers = user_headers
         if json_default_content_type:
             merged_headers = _merge_default_header(
@@ -1070,13 +634,8 @@ class HttpClient:
         self.url = url
         self._tx_buffer = request_bytes
         self._tx_offset = 0
-        # Per-request parser.  Buffered requests get the long-lived body
-        # buffer so per-request body alloc only happens for oversize
-        # responses; streamed requests get a fresh per-hop staging
-        # window instead — the handle keeps it (and any undrained
-        # bytes) alive after the client goes idle, so sharing the
-        # long-lived buffer would let the next request clobber a
-        # finished stream's tail.
+        # Streamed requests get a fresh per-hop window: the handle keeps it
+        # alive after the client goes idle, so a shared buffer would clobber it.
         if self._stream:
             self._parser = ResponseParser(
                 max_body_bytes=self._max_body_bytes,
@@ -1089,17 +648,11 @@ class HttpClient:
                 body_buffer=self._body_buffer,
                 body_buffer_view=self._body_buffer_view,
             )
-        # Defer the SENDING transition until the connector reaches
-        # ``ready`` inside :meth:`_advance_connector`; until then the
-        # tick path stays in AWAITING_TRANSPORT and yields between
-        # connect phases.
         self._state = _RequestState.AWAITING_TRANSPORT
 
     def _drive_send(self):
-        """Push queued request bytes onto the socket; transition on completion."""
-        # Bind the buffer view once, not per iteration: a backpressured
-        # send loops here, and rebuilding memoryview(self._tx_buffer) each
-        # pass allocates a fresh base view every time.
+        # Bind the view once, not per iteration: a backpressured send loops
+        # here and rebuilding it each pass would allocate.
         tx_view = memoryview(self._tx_buffer)
         while self._tx_offset < len(self._tx_buffer):
             view = tx_view[self._tx_offset:]
@@ -1110,31 +663,15 @@ class HttpClient:
                     return
                 raise
             if sent <= 0:
-                return  # Socket would block — wait for next tick.
+                return  # Socket would block; wait for next tick.
             self._tx_offset += sent
-        # Release the sent request bytes before the receive phase — the
-        # response path never re-reads them, and holding the full
-        # request (headers + body) pinned through receive would keep a
-        # second copy of the body resident for the whole exchange.
+        # Release the sent bytes before receiving: holding them pinned
+        # keeps a second copy of the body resident for the whole exchange.
         self._tx_buffer = b""
         self._tx_offset = 0
         self._state = _RequestState.RECEIVING
 
     def _drive_recv(self):
-        """Drain the socket up to ``recv_budget_per_tick``; feed the parser.
-
-        Recv goes into the pre-allocated :attr:`_recv_buffer`; the
-        :meth:`ResponseParser.feed` call gets a ``memoryview`` window into
-        that buffer so neither the recv nor the feed allocates per tick.
-        The parser copies the bytes it keeps (into ``_buffer`` or ``_body``)
-        before returning, so the memoryview's lifetime ends with the call.
-
-        A streamed request additionally bounds every recv by the
-        parser's free staging space — decoded body bytes never exceed
-        the wire bytes fed, for any framing, so the staging window can
-        never overflow — and stops reading entirely (backpressure)
-        while the window is full, resuming once the caller drains it.
-        """
         consumed = 0
         budget = self._recv_budget_per_tick
         scratch_size = len(self._recv_buffer)
@@ -1149,7 +686,7 @@ class HttpClient:
                 if capacity > free:
                     capacity = free
                 if capacity == 0:
-                    # Staging full — wait for read_body_into to drain.
+                    # Staging full; wait for read_body_into to drain.
                     return
             try:
                 got = self._socket.recv_into(self._recv_view, capacity)
@@ -1158,9 +695,7 @@ class HttpClient:
                     return
                 raise
             if got == 0:
-                # Peer close — feed_eof so the parser can decide if
-                # this is end-of-body (length-unknown) or a protocol
-                # error (Content-Length short).
+                # Peer close: let feed_eof decide end-of-body vs. protocol error.
                 parser.feed_eof()
                 break
             parser.feed(self._recv_view[:got])
@@ -1173,17 +708,6 @@ class HttpClient:
             self._complete()
 
     def _sync_stream_state(self):
-        """Publish or discard a streamed response once its headers are in.
-
-        Runs after every parser feed of a streamed request.  Three
-        outcomes: headers not complete yet (or already handled) — do
-        nothing; the response is a followable redirect — discard its
-        staged body bytes so a hop's payload is never delivered; else
-        publish ``handle.response`` (a :class:`Response` with
-        ``streamed=True`` and an empty ``body``) and install the parser
-        as the handle's body source, so the caller can start draining
-        while the rest of the body is still arriving.
-        """
         parser = self._parser
         if not parser.headers_complete or parser.state == ParseState.ERROR:
             return
@@ -1209,27 +733,20 @@ class HttpClient:
         handle._publish_stream(response, parser)  # noqa: SLF001 - internal handoff
 
     def _complete(self):
-        """Follow a redirect or hand the response to the handle.
-
-        Checks the redirect path against the parser directly so the
-        body-snapshot (``bytes(memoryview)`` inside ``parser.body``)
-        only fires when we're about to return the response.
-        """
         parser = self._parser
         status_code = parser.status_code
         if self._stream:
-            # feed_eof can reach DONE without a trailing feed, so run
-            # the publish/discard decision once more before finishing.
+            # feed_eof can reach DONE without a trailing feed, so run the
+            # publish/discard decision once more before finishing.
             self._sync_stream_state()
             handle = self._handle
             if handle.response is None:
-                # Only a followable redirect hop reaches DONE without a
-                # published response, so Location is present here.
+                # Only a followable redirect hop reaches DONE unpublished,
+                # so Location is present here.
                 self._follow_redirect(status_code, parser.headers.get("Location"))
                 return
-            # Marks the already-published response done; the handle
-            # keeps the parser, so staged bytes stay readable after
-            # the client resets to idle below.
+            # Mark the published response done; the handle keeps the parser
+            # so staged bytes stay readable after reset.
             handle._set_response(handle.response)  # noqa: SLF001 - internal handoff
             self._reset_socket()
             return
@@ -1251,12 +768,6 @@ class HttpClient:
         self._reset_socket()
 
     def _follow_redirect(self, status_code, location):
-        """Resolve the next URL, swap state, and re-issue the request.
-
-        For 301 / 302 / 303 the next hop is always GET with no body —
-        matches long-standing browser + RFC 7231 §6.4 guidance.  For
-        307 / 308 the original method + body are preserved.
-        """
         try:
             new_url = resolve_redirect_url(self.url, location)
         except HttpError as redirect_error:
@@ -1268,13 +779,11 @@ class HttpClient:
             next_body = self._original_body
             next_json_default_content_type = self._original_json_body is not None
         else:
-            # 301 / 302 / 303 — drop body, switch to GET.
+            # 301 / 302 / 303: drop body, switch to GET.
             next_method = "GET"
             next_body = None
             next_json_default_content_type = False
-        # Tear down the current socket but keep the handle + deadline +
-        # original-request capture in place — the request as a whole
-        # is still in flight.
+        # Keep the handle, deadline, and capture: the request is still in flight.
         self._close_socket_only()
         self._redirects_remaining -= 1
         try:
@@ -1297,9 +806,7 @@ class HttpClient:
             self._reset_socket()
 
     def _fail(self, error):
-        """Attach *error* to the in-flight handle, close the socket, reset."""
-        # If the parser raised oversized while we were configured to
-        # drop, swap the error for an oversized-event hook firing.
+        # Oversized under a drop policy completes as a drop, not a failure.
         if isinstance(error, HttpOversizedError):
             if self._when_oversized == WhenOversized.DROP_SILENT:
                 self._complete_oversized_drop()
@@ -1308,13 +815,12 @@ class HttpClient:
                 self.on_oversized(error.reported_length, self.url)
                 self._complete_oversized_drop()
                 return
-            # DISCONNECT — fall through to fail path.
+            # DISCONNECT: fall through to fail path.
         if self._handle is not None:
             self._handle._set_error(error)  # noqa: SLF001 - internal handoff
         self._reset_socket()
 
     def _complete_oversized_drop(self):
-        """Finish the request as a drop: empty body, oversized_dropped=True."""
         response = Response(
             status_code=self._parser.status_code,
             reason=self._parser.reason,
@@ -1328,9 +834,6 @@ class HttpClient:
         self._reset_socket()
 
     def _close_socket_only(self):
-        """Close the socket / connector but leave the handle + deadline
-        + redirect bookkeeping intact.  Used between redirect hops
-        where the request as a whole is still in flight."""
         if self._connector is not None:
             self._connector.cancel()
             self._connector = None
@@ -1342,22 +845,10 @@ class HttpClient:
         self._socket = None
         self._tx_buffer = b""
         self._tx_offset = 0
-        # Drop the parser instance — the long-lived body buffer it was
-        # using stays alive on ``self._body_buffer`` and gets handed to
-        # the next request's parser.  Only the small parser scaffolding
-        # (cursor, headers dict, etc.) is freed here.
         self._parser = None
-        self._state = _RequestState.IDLE  # Brief — _start_hop flips back.
+        self._state = _RequestState.IDLE  # Brief; _start_hop flips back.
 
     def _reset_socket(self):
-        """Close the socket best-effort and clear all per-request state.
-
-        Queues the finished handle's completion callback on
-        :attr:`_completed_handle` rather than firing it here — the
-        client is fully idle by the time :meth:`_fire_completion` runs
-        it, so a callback that issues the next request doesn't trip
-        :class:`HttpBusyError`.
-        """
         self._close_socket_only()
         finished_handle = self._handle
         self._handle = None

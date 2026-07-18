@@ -1,40 +1,6 @@
 """Generator helpers for socket I/O driven by a tick-based scheduler.
 
-Opt-in submodule — import explicitly::
-
-    from chumicro_sockets.generators import connect, recv_until, send_all
-
-The four helpers — ``connect``, ``send_all``, ``recv_until``,
-``recv_exact`` — let a generator express a socket lifecycle
-top-to-bottom::
-
-    def echo_run(connector):
-        sock = yield from connect(connector)
-        try:
-            yield from send_all(sock, b"hello\\n")
-            reply = yield from recv_until(sock, b"\\n", max_bytes=4096)
-        finally:
-            sock.close()
-
-The helpers operate on **duck-typed** inputs:
-
-* ``connect`` takes any object exposing the ``SocketConnector``
-  surface (``state`` / ``socket`` / ``last_error`` / ``io_socket`` /
-  ``io_interest`` / ``tick`` / ``cancel``) and
-  yields it directly, so the driving scheduler reads the connector's
-  own interest progression through DNS / TCP / TLS / ready.
-* ``send_all`` / ``recv_until`` / ``recv_exact`` take any non-blocking
-  socket exposing ``send`` / ``recv_into`` that raises
-  ``OSError(EAGAIN)`` when it would block.  They yield the
-  ``ReadWait`` / ``WriteWait`` markers from ``chumicro_sockets.waits``,
-  carrying the socket so the scheduler registers it for the right poll
-  direction.
-
-Heap-DoS protection: ``recv_until`` and ``recv_exact`` both require
-``max_bytes`` and refuse to allocate above it — ``recv_until`` caps the
-accumulator it grows, ``recv_exact`` caps the fixed buffer it pre-allocates
-so a peer-controlled ``byte_count`` can't force an unbounded allocation.
-Both reject non-positive sizes up front.
+The public helpers are ``connect``, ``send_all``, ``recv_until``, and ``recv_exact``.
 """
 
 import errno
@@ -48,64 +14,21 @@ def connect(
     timeout_ms: int | None = None,
     ticks: object | None = None,
 ) -> object:
-    """Drive *connector* across runner ticks; return its connected socket.
-
-    Yields the connector itself on every tick so the wrapper reads
-    ``connector.io_socket`` / ``io_interest(now_ms)``
-    directly — the connector's own interest progression through
-    DNS -> TCP -> (TLS) -> ready is what gates the ipoll
-    registration.  Returns the connected, non-blocking socket via
-    PEP 380 — call as ``sock = yield from connect(connector)``.
-
-    The connector's per-phase blocking compromises still apply:
-    CircuitPython's TCP+TLS collapse into one blocking ``connect()``
-    inside a single tick; MicroPython's TLS handshake blocks inline.
-    The synchronous-tick parts of those phases stall the runner for
-    their duration — no different from driving the connector under a
-    check / handle service.
-
-    Each resume threads the runner's ``now_ms`` into
-    ``connector.tick(now_ms)`` so a connector that tracks its own
-    deadline sees the real clock; the priming tick before the first
-    resume passes ``0``.
-
-    On cancellation (``GeneratorExit``) or failure, the connector's
-    ``cancel`` runs in a ``finally`` block so any in-flight socket
-    closes cleanly.
+    """Drive *connector* across runner ticks and return its connected socket.
 
     Args:
-        connector: Any object exposing the ``SocketConnector``
-            surface — ``state``, ``socket``, ``last_error``,
-            ``io_socket``, ``io_interest(now_ms)``,
-            ``tick(now_ms)``, ``cancel()``.  The real
-            ``chumicro_sockets.connector()`` returns such objects;
-            ``FakeSocketConnector`` in ``chumicro_sockets.testing``
-            is the test stand-in.
-        timeout_ms: Optional deadline in milliseconds for the whole
-            connect (DNS attempt + TCP + optional TLS).  ``None``
-            (default) waits indefinitely.  On expiry the connector is
-            cancelled and ``OSError(ETIMEDOUT)`` is raised.  The DNS
-            lookup runs as one synchronous ``getaddrinfo`` inside the
-            connector's first tick and is blocking-by-substrate on real
-            boards, so a hang *inside* that call cannot be interrupted —
-            the deadline is only checked between ticks.
-        ticks: ``chumicro_timing``-shaped tick source
-            (``ticks_ms`` / ``ticks_add`` / ``ticks_diff``).  Required
-            when *timeout_ms* is set; ignored otherwise.
+        connector: Any object exposing the ``SocketConnector`` surface.
+        timeout_ms: Deadline in ms for the whole connect; ``None`` waits indefinitely.
+        ticks: ``chumicro_timing``-shaped tick source; required when *timeout_ms* is set.
 
     Yields:
         The connector itself, repeatedly, until terminal.
 
     Returns:
-        Connected socket — non-blocking, ready for ``send`` /
-        ``recv_into``.  The caller owns lifecycle (``sock.close()``
-        in a ``try / finally`` or ``with`` block).
+        The connected, non-blocking socket; the caller owns its lifecycle.
 
     Raises:
-        OSError: Connector reached ``failed`` (DNS lookup, TCP
-            connect, or TLS handshake failed) — the connector's
-            ``last_error`` is raised — or ``ETIMEDOUT`` when
-            *timeout_ms* elapsed before the connector became ready.
+        OSError: The connector reached ``failed``, or ``ETIMEDOUT`` on timeout.
         ValueError: *timeout_ms* was given without a *ticks* source.
     """
     if timeout_ms is not None and ticks is None:
@@ -140,23 +63,15 @@ def connect(
 def send_all(sock: object, data: object) -> object:
     """Send every byte of *data*, yielding on ``EAGAIN``.
 
-    Loops on ``sock.send`` until the whole buffer is written.  Each
-    EAGAIN yields a single cached ``WriteWait(sock)``, and the unsent
-    remainder is re-sliced only after a partial send makes progress —
-    so an EAGAIN spin reuses both the wait and the slice and allocates
-    nothing.
-
     Args:
-        sock: Non-blocking TCP socket (typically returned by
-            :func:`connect`).
+        sock: Non-blocking TCP socket.
         data: Bytes-like object to transmit.
 
     Yields:
-        A ``WriteWait`` carrying *sock* on each EAGAIN.
+        A ``WriteWait`` carrying *sock* on each ``EAGAIN``.
 
     Raises:
-        OSError: Peer closed mid-send (``send`` returned 0) or the
-            socket reported a non-EAGAIN error.
+        OSError: The peer closed mid-send, or the socket reported a non-EAGAIN error.
     """
     view = memoryview(data)
     total = len(view)
@@ -178,37 +93,21 @@ def send_all(sock: object, data: object) -> object:
 
 
 def recv_until(sock: object, separator: object, *, max_bytes: int) -> bytes:
-    """Read bytes until *separator* appears; return everything up to and including it.
-
-    Loops on ``sock.recv_into`` into a 256-byte scratch buffer,
-    extending an accumulator until ``separator in accumulator`` or
-    growth would exceed *max_bytes*.  Each EAGAIN yields a single
-    cached ``ReadWait`` carrying *sock*.
+    """Read until *separator* appears; return everything up to and including it.
 
     Args:
         sock: Non-blocking TCP socket.
-        separator: Bytes pattern that terminates the read (e.g.
-            ``b"\\r\\n"`` for HTTP, ``b"\\n"`` for line-oriented).
-        max_bytes: Hard cap on accumulated bytes.  The helper refuses
-            input above this — required because the peer controls
-            how much they send before the separator arrives, and an
-            unbounded sink is heap-DoS surface on a 256 KB device.
+        separator: Bytes pattern that terminates the read (for example ``b"\\r\\n"``).
+        max_bytes: Hard cap on accumulated bytes, so a peer cannot force an unbounded read.
 
     Yields:
-        A ``ReadWait`` on each EAGAIN.
+        A ``ReadWait`` on each ``EAGAIN``.
 
     Returns:
-        ``bytes`` — from the start through the first occurrence of
-        *separator*, inclusive.  Bytes received past the separator
-        in the same ``recv_into`` chunk are discarded; this helper is
-        for one-shot reads where the peer does not pipeline.  For
-        framed protocols where pipelining is normal, drive the
-        socket through a stateful buffer instead.
+        ``bytes`` from the start through the first occurrence of *separator*, inclusive.
 
     Raises:
-        OSError: Peer closed before the separator arrived, growth
-            exceeded *max_bytes*, or the socket reported a non-EAGAIN
-            error.
+        OSError: The peer closed before the separator, growth exceeded *max_bytes*, or a non-EAGAIN error.
         ValueError: *max_bytes* is not positive.
     """
     if max_bytes <= 0:
@@ -231,10 +130,8 @@ def recv_until(sock: object, separator: object, *, max_bytes: int) -> bytes:
         if nbytes == 0:
             raise OSError("peer closed before separator")
         accumulator.extend(chunk_view[:nbytes])
-        # Search before enforcing the cap: a chunk that pushes the
-        # accumulator past max_bytes may still contain the separator
-        # within the cap (the trailing bytes are just discarded), which
-        # the old pre-extend check rejected as too-long.
+        # Search before enforcing the cap: a chunk that pushes the accumulator
+        # past max_bytes may still hold the separator within the cap.
         sep_index = accumulator.find(separator)
         if sep_index != -1 and sep_index + sep_length <= max_bytes:
             return bytes(accumulator[: sep_index + sep_length])
@@ -243,35 +140,22 @@ def recv_until(sock: object, separator: object, *, max_bytes: int) -> bytes:
 
 
 def recv_exact(sock: object, byte_count: int, *, max_bytes: int) -> bytes:
-    """Read exactly *byte_count* bytes; return them as ``bytes``.
-
-    Loops on ``sock.recv_into`` into a pre-allocated *byte_count*-byte
-    buffer, re-slicing the unfilled tail only after a recv makes
-    progress — so an EAGAIN spin reuses both the cached ``ReadWait`` and
-    the slice and allocates nothing.
+    """Read exactly *byte_count* bytes and return them as ``bytes``.
 
     Args:
         sock: Non-blocking TCP socket.
-        byte_count: Number of bytes to read.  Must be positive.
-        max_bytes: Hard cap on the buffer this helper will allocate.
-            *byte_count* above it is refused before the ``bytearray`` is
-            built — required because a caller wiring a peer-controlled
-            length (Content-Length, remaining-length) into *byte_count*
-            would otherwise trigger an unbounded allocation, the same
-            heap-DoS surface ``recv_until`` bounds with its own
-            *max_bytes*.
+        byte_count: Number of bytes to read. Must be positive.
+        max_bytes: Hard cap on the buffer, so a peer-controlled length cannot force an unbounded allocation.
 
     Yields:
-        A ``ReadWait`` on each EAGAIN.
+        A ``ReadWait`` on each ``EAGAIN``.
 
     Returns:
         ``bytes`` of length exactly *byte_count*.
 
     Raises:
-        OSError: Peer closed before *byte_count* bytes arrived, or the
-            socket reported a non-EAGAIN error.
-        ValueError: *byte_count* is not positive, *max_bytes* is not
-            positive, or *byte_count* exceeds *max_bytes*.
+        OSError: The peer closed before *byte_count* bytes arrived, or a non-EAGAIN error.
+        ValueError: *byte_count* or *max_bytes* is not positive, or *byte_count* exceeds *max_bytes*.
     """
     if byte_count <= 0:
         raise ValueError("byte_count must be positive")

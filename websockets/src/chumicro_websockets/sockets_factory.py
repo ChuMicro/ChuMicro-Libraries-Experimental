@@ -1,23 +1,8 @@
-"""Default :mod:`chumicro_sockets` wiring for the WebSocket client and server.
-
-Opt-in submodule.  The package's ``__init__.py`` does not import it,
-so users who pass their own ``transport_factory`` (client) or
-``listener`` (server) never pull :mod:`chumicro_sockets` into the
-deploy graph.
-"""
+"""Default :mod:`chumicro_sockets` wiring for the WebSocket client and server."""
 
 
 def chumicro_sockets_listener(config, *, radio=None):
-    """Build the default WebSocket-server listening socket from *config*.
-
-    Reads ``websockets.server.host`` / ``websockets.server.port``
-    (defaulting to ``0.0.0.0:8765``) and binds a
-    :func:`chumicro_sockets.listener`.
-
-    Lives here, not in the eagerly-imported ``server`` module, so a
-    client-only deploy that skips this factory submodule never drags
-    :mod:`chumicro_sockets` onto the board.
-    """
+    """Build the default WebSocket-server listening socket from *config*."""
     from chumicro_sockets import listener  # noqa: PLC0415 - lazy
 
     host = config.get("websockets.server.host", "0.0.0.0")
@@ -26,19 +11,7 @@ def chumicro_sockets_listener(config, *, radio=None):
 
 
 def chumicro_sockets_connector_factory(*, radio=None, ssl_context=None):
-    """Build a ``(host, port, use_tls) -> connector`` factory.
-
-    Routes to :func:`chumicro_sockets.connector` — ``use_tls`` maps to
-    its ``tls=`` flag, with the supplied *ssl_context*.  CA pinning
-    via :func:`chumicro_sockets.ssl_context_with_ca` is required for
-    ``wss://`` on constrained boards.
-
-    The returned callable is what
-    ``WebSocketClient(transport_factory=...)`` expects: each connect()
-    invokes ``factory(host, port, use_tls)`` and drives the resulting
-    non-blocking connector across ticks until ``ready`` before the
-    HTTP upgrade exchange begins.
-    """
+    """Build a ``(host, port, use_tls) -> connector`` factory."""
     def factory(host, port, use_tls):
         from chumicro_sockets import connector  # noqa: PLC0415 - lazy
 

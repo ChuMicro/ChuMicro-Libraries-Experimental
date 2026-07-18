@@ -45,7 +45,7 @@
         "mqtt/examples/telemetry.py"
       ],
       "readme_path": "mqtt/README.md",
-      "version": "0.26.0"
+      "version": "0.27.0"
     },
     "chumicro_msgpack": {
       "description": "Compact MessagePack serialization for CircuitPython, MicroPython, and CPython \u2014 delegates to the native C module when available.",
@@ -142,5 +142,5 @@
       "version": "0.8.0"
     }
   },
-  "tag": "20260718.153658"
+  "tag": "20260718.222643"
 }

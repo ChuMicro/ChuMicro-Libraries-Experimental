@@ -1,26 +1,4 @@
-"""HTTP/1.1 wire format for chumicro-requests.
-
-Consolidates URL parsing, request encoding, response parsing, the
-case-insensitive header dict, exception hierarchy, and protocol
-constants.  Wire-format primitives live in one file
-(bytes-on-the-wire); orchestration lives in another (``client.py``).
-
-The response parser is a streaming state machine fed raw bytes via
-:meth:`ResponseParser.feed`; it transitions
-``STATUS -> HEADERS -> BODY -> DONE`` as bytes arrive.  No socket I/O
-here — the client drives the socket and feeds bytes in.
-
-v1 scope:
-
-* HTTP and HTTPS via :mod:`chumicro_sockets` TLS.
-* Body is buffered in full (capped by ``max_body_bytes``) by default,
-  or staged incrementally through a fixed window when the parser is
-  built with ``stream_body=True``.
-* ``Content-Length``-framed responses, read-until-close, and
-  chunked transfer-encoding decode.
-* No header folding (RFC 7230 deprecates it); multi-value headers
-  join with ``, `` per RFC 7230 §3.2.2.
-"""
+"""HTTP/1.1 wire format primitives for chumicro-requests."""
 
 try:
     from micropython import const
@@ -29,23 +7,12 @@ except ImportError:
         return value
 
 
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-
 class HttpError(Exception):
     """Base class for every chumicro-requests failure."""
 
 
 class HttpProtocolError(HttpError):
-    """Server sent bytes the spec doesn't allow.
-
-    Malformed status line, header without a colon, body shorter than
-    the advertised ``Content-Length``, etc.  Always a peer or network
-    bug — the right response is usually fail the request and surface
-    the error to the caller.
-    """
+    """Server sent bytes the spec doesn't allow."""
 
 
 class HttpTimeoutError(HttpError):
@@ -53,11 +20,7 @@ class HttpTimeoutError(HttpError):
 
 
 class HttpBusyError(HttpError):
-    """Caller issued a request while another was still in flight.
-
-    v1 of chumicro-requests is single-in-flight — the caller must wait
-    for ``handle.done`` before issuing another.
-    """
+    """Caller issued a request while another was still in flight."""
 
 
 class HttpURLError(HttpError):
@@ -65,51 +28,26 @@ class HttpURLError(HttpError):
 
 
 class HttpOversizedError(HttpError):
-    """Response body exceeded ``max_body_bytes``.
-
-    Raised when ``when_oversized=DISCONNECT``.  The other policies
-    (``DROP_SILENT``, ``DROP_WITH_EVENT``) drop the payload silently
-    or fire an event without raising.
-
-    ``reported_length`` is the projected total body size at the moment
-    the cap was crossed — useful when the error is re-raised to the
-    caller under ``DISCONNECT``.
-    """
+    """Response body exceeded ``max_body_bytes``."""
 
     def __init__(self, message: str, *, reported_length: int) -> None:
         super().__init__(message)
         self.reported_length = reported_length
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-#: Default max buffered response body.  64 KB leaves headroom on a
-#: 256 KB MCU RAM minimum board.
+#: Default max buffered response body, in bytes.
 DEFAULT_MAX_BODY_BYTES = const(65536)
 
-#: Default cap on the accumulated status-line + header (and chunk-frame)
-#: bytes before the body.  ``max_body_bytes`` bounds only the body, so
-#: without this a peer dribbling header bytes with no CRLF could grow the
-#: staging buffer until the heap is exhausted on a 264 KB board.
+#: Default cap on status-line + header bytes staged before the body.
 DEFAULT_MAX_HEADER_BYTES = const(16384)
 
-#: Default per-tick recv cap.  Keeps tick latency LED-friendly.
+#: Default per-tick recv cap, in bytes.
 DEFAULT_RECV_BUDGET_PER_TICK = const(1024)
 
 #: Default steady-state body buffer size for :class:`ResponseParser`.
-#: Sized to cover typical sensor + JSON-API response bodies (most
-#: small-board HTTP traffic) without per-request allocation.  Bodies
-#: bigger than this fall back to a one-shot ``bytearray(content_length)``
-#: released when the parser is dereferenced.
 DEFAULT_BODY_BUFFER_SIZE = const(1024)
 
-#: Default staging capacity for a streamed response body
-#: (``stream=True`` requests).  The parser holds at most this many
-#: decoded-but-unread body bytes; the socket recv pauses while the
-#: window is full, so this constant — not the body size — is the
-#: response's RAM cost.
+#: Default staging capacity for a streamed response body (``stream=True``).
 DEFAULT_STREAM_BUFFER_SIZE = const(1024)
 
 #: Default per-request timeout in ms.
@@ -118,15 +56,11 @@ DEFAULT_TIMEOUT_MS = const(10000)
 #: Default per-request redirect budget.
 DEFAULT_MAX_REDIRECTS = const(5)
 
-#: Status codes that the client follows when a ``Location`` header is
-#: present and the per-request redirect budget allows.  301/302/303
-#: switch the next request's method to ``GET`` (per RFC 7231 §6.4 +
-#: long-standing browser behavior); 307/308 preserve the original
-#: method and body.
+#: Status codes the client follows when a ``Location`` header is present.
 REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 
-#: Subset of :data:`REDIRECT_STATUS_CODES` that preserve the original
-#: HTTP method on the next hop (RFC 7231 §6.4.7 + §6.4.8 + RFC 7538).
+#: Redirect codes that preserve the request method on the next hop
+#: (RFC 7231 §6.4.7 + §6.4.8 + RFC 7538).
 METHOD_PRESERVING_REDIRECT_STATUS_CODES = frozenset({307, 308})
 
 #: HTTP/1.1 line terminator.
@@ -135,31 +69,12 @@ CRLF = b"\r\n"
 #: Header / body separator.
 CRLF_CRLF = b"\r\n\r\n"
 
-#: Status codes that MUST NOT have a body per RFC 7230 §3.3.3.  We
-#: short-circuit body parsing for these to avoid hanging on a server
-#: that omits ``Content-Length: 0``.
+#: Status codes that MUST NOT have a body (RFC 7230 §3.3.3).
 NO_BODY_STATUS_CODES = frozenset({204, 304})
-
-
-# ---------------------------------------------------------------------------
-# Content-Type charset parsing
-# ---------------------------------------------------------------------------
 
 
 def parse_charset(content_type: str | None) -> str:  # noqa: CHU027 - same primitive in chumicro-http-server _wire.py; per-consumer duplication kept intentionally
     """Extract the ``charset=...`` parameter from a Content-Type header.
-
-    Per RFC 7231 §3.1.1.5 the Content-Type value may carry a
-    ``charset`` parameter — for example ``text/html; charset=utf-8``
-    or ``application/json; charset="ISO-8859-1"``.  We tokenize on
-    semicolons, look for a ``charset=`` token (case-insensitive),
-    strip optional surrounding quotes per RFC 7231 §3.1.1.1, and
-    fall back to ``"utf-8"`` when no charset is present or the
-    header itself is missing.
-
-    Defaulting to UTF-8 matches RFC 8259 §8.1 for ``application/json``
-    and aligns with current web practice for ``text/*`` even though
-    historical RFC 2616 defaulted text to ISO-8859-1.
 
     Args:
         content_type: Raw ``Content-Type`` header value, or ``None``.
@@ -181,30 +96,17 @@ def parse_charset(content_type: str | None) -> str:  # noqa: CHU027 - same primi
     return "utf-8"
 
 
-# ---------------------------------------------------------------------------
-# URL parsing
-# ---------------------------------------------------------------------------
-
-
 def parse_url(url: str) -> tuple[str, str, int, str]:
     """Split *url* into ``(scheme, host, port, path)``.
 
     Args:
-        url: HTTP or HTTPS URL.  Examples:
-            ``parse_url("http://example.com/")`` returns
-            ``("http", "example.com", 80, "/")``.
-            ``parse_url("http://example.com:8080/path?q=1")`` returns
-            ``("http", "example.com", 8080, "/path?q=1")``.
-            ``parse_url("https://example.com")`` returns
-            ``("https", "example.com", 443, "/")``.
+        url: HTTP or HTTPS URL to split.
 
     Returns:
-        4-tuple ``(scheme, host, port, path)``.  *path* always starts
-        with ``/`` and includes the query string if present.
+        4-tuple ``(scheme, host, port, path)``; *path* starts with ``/``.
 
     Raises:
-        HttpURLError: Scheme is not ``http`` / ``https``, host is
-            missing, or port is not a base-10 integer.
+        HttpURLError: Bad scheme, missing host, or non-integer port.
     """
     if not isinstance(url, str):
         raise HttpURLError(f"url must be str, got {type(url).__name__}")
@@ -223,10 +125,7 @@ def parse_url(url: str) -> tuple[str, str, int, str]:
     if not rest:
         raise HttpURLError(f"url is missing host: {url!r}")
 
-    # The authority (host[:port]) ends at the first '/', '?', or '#'.
-    # Splitting only on '/' would fold a query into the host
-    # ('http://host?q=1') or into the port ('http://host:8080?q=1' ->
-    # non-integer port error).
+    # Authority ends at the first '/', '?', or '#'.
     authority_end = len(rest)
     for delimiter in ("/", "?", "#"):
         index = rest.find(delimiter)
@@ -267,21 +166,8 @@ def parse_url(url: str) -> tuple[str, str, int, str]:
     return scheme, host, port, path
 
 
-# ---------------------------------------------------------------------------
-# Redirect URL resolution
-# ---------------------------------------------------------------------------
-
-
 def resolve_redirect_url(current_url: str, location: str) -> str:
     """Resolve a ``Location`` header value against the current request URL.
-
-    Handles the three RFC 7231 §7.1.2 reference shapes:
-
-    * **Absolute** — ``http://...`` / ``https://...``: returned verbatim.
-    * **Absolute-path** — starts with ``/``: keeps current scheme + host
-      + port, replaces path + query.
-    * **Relative-path** — anything else: keeps current scheme + host +
-      port, replaces the last path segment.
 
     Args:
         current_url: The URL of the request being redirected.
@@ -297,10 +183,7 @@ def resolve_redirect_url(current_url: str, location: str) -> str:
         raise HttpURLError("redirect Location header is empty")
     if location.startswith("http://") or location.startswith("https://"):
         return location
-    # Reject other absolute-URL schemes (`ftp://...`, `mailto:...`,
-    # etc.) before they get misclassified as relative paths.  An
-    # absolute URL has a scheme delimiter (``:``) before the first
-    # path slash; relative paths never do.
+    # Reject absolute-URL schemes (ftp:, mailto:) misread as relative paths.
     first_slash = location.find("/")
     scheme_zone = location if first_slash == -1 else location[:first_slash]
     if ":" in scheme_zone:
@@ -312,8 +195,6 @@ def resolve_redirect_url(current_url: str, location: str) -> str:
     host_part = host if port == default_port else f"{host}:{port}"
     if location.startswith("/"):
         return f"{scheme}://{host_part}{location}"
-    # Relative path — strip query from current path, then drop the
-    # last segment, then join with the relative location.
     query_index = current_path.find("?")
     base_path = current_path[:query_index] if query_index != -1 else current_path
     last_slash = base_path.rfind("/")
@@ -324,35 +205,12 @@ def resolve_redirect_url(current_url: str, location: str) -> str:
     return f"{scheme}://{host_part}{base_path}{location}"
 
 
-# ---------------------------------------------------------------------------
-# Case-insensitive header dict
-# ---------------------------------------------------------------------------
-
-
 class CaseInsensitiveDict:
-    """Header dict whose lookups fold to lowercase.
-
-    HTTP/1.1 §3.2 requires header names to be case-insensitive on
-    receipt (servers and clients alike).  We store the original-cased
-    name (so callers see ``Content-Type`` and not ``content-type``)
-    keyed off the lowercased form.
-
-    Multi-value headers (``Set-Cookie``, ``Via``) join with ``, ``
-    per RFC 7230 §3.2.2 when the same header arrives twice; v1 has
-    no cookie jar so the join is informational.
-
-    Implements ``__getitem__`` / ``__setitem__`` / ``__contains__`` /
-    ``__len__`` / ``__iter__`` / ``get`` / ``items`` — enough for the
-    response API surface.  Not a full :class:`MutableMapping` to keep
-    the embedded footprint small.
-    """
+    """Header dict whose lookups fold to lowercase."""
 
     def __init__(self):  # noqa: CHU027 - same primitive in chumicro-http-server _wire.py; per-consumer duplication kept intentionally
-        # Lowercase key -> (original_name, value).  Paired with
-        # ``_order`` (list of lowercase keys) so iteration preserves
-        # insertion order on every runtime — MicroPython and
-        # CircuitPython dicts do not guarantee insertion order, unlike
-        # CPython 3.7+.
+        # _order preserves insertion order where MicroPython /
+        # CircuitPython dicts do not.
         self._entries = {}
         self._order = []
 
@@ -407,11 +265,7 @@ class CaseInsensitiveDict:
             yield self._entries[lower]
 
     def add(self, name, value):  # noqa: CHU027 - same primitive in chumicro-http-server _wire.py; per-consumer duplication kept intentionally
-        """Append *value* to the existing header, joining with ``, ``.
-
-        New keys behave like :meth:`__setitem__`.  Used by the parser
-        for repeated header lines (``Set-Cookie``, ``Via``).
-        """
+        """Append *value* to the existing header, joining with ``, ``."""
         lower = name.lower()
         existing = self._entries.get(lower)
         if existing is None:
@@ -423,22 +277,9 @@ class CaseInsensitiveDict:
         self._entries[lower] = (original_name, joined)
 
 
-# ---------------------------------------------------------------------------
-# Request encoding
-# ---------------------------------------------------------------------------
-
-
 def _reject_unsafe_chars(label: str, value: str) -> None:
-    """Raise :class:`HttpURLError` if *value* can't go on the ASCII wire.
-
-    Rejects CR, LF, and NUL (a caller-controlled value carrying them
-    could splice extra headers or a second request onto the wire) and
-    any character above ``0x7E``.  Non-ASCII diverges by runtime: the
-    encoder's ``str.encode("ascii")`` raises ``UnicodeEncodeError`` on
-    CPython but MicroPython silently emits UTF-8 bytes, so the header a
-    caller sets would reach the server as different bytes.  Rejecting
-    here makes the outcome one catchable error on every runtime.
-    """
+    # Reject CR / LF / NUL (request-splitting) and non-ASCII, which
+    # diverges across runtimes.
     for character in value:
         if character in ("\r", "\n", "\x00") or ord(character) > 0x7E:
             raise HttpURLError(
@@ -458,26 +299,18 @@ def encode_request(
     """Encode an HTTP/1.1 request into bytes ready for the wire.
 
     Args:
-        method: HTTP verb — ``"GET"``, ``"POST"``, etc.  Sent verbatim.
-        host: Value for the ``Host:`` header (typically the URL host;
-            include the port via ``"host:port"`` if non-default).
-        path: Request-target — typically the URL path + query.
-        headers: Optional iterable of ``(name, value)`` pairs, a plain
-            ``dict``, or a :class:`CaseInsensitiveDict`.  Caller-supplied
-            headers override the defaults (``Host``, ``User-Agent``,
-            ``Accept``, ``Accept-Encoding``, ``Connection``).
-        body: Optional ``bytes`` body.  When set, ``Content-Length`` is
-            auto-added (callers can override via *headers*).
-        user_agent: Override the default ``User-Agent`` string.
+        method: HTTP verb, sent verbatim.
+        host: Value for the ``Host:`` header.
+        path: Request-target, typically the URL path + query.
+        headers: Optional ``(name, value)`` pairs, dict, or CaseInsensitiveDict; override the defaults.
+        body: Optional ``bytes`` body; adds ``Content-Length`` when set.
+        user_agent: Override for the default ``User-Agent`` string.
 
     Returns:
         Encoded request as ``bytes``.
 
     Raises:
-        HttpURLError: A method, path, header name, or header value holds
-            CR / LF / NUL or a non-ASCII character.  The request line and
-            headers are ASCII-only on the wire, so non-ASCII is refused
-            here rather than encoded differently on each runtime.
+        HttpURLError: A method, path, or header holds CR / LF / NUL or non-ASCII.
     """
     merged = CaseInsensitiveDict()
     merged["Host"] = host
@@ -485,9 +318,8 @@ def encode_request(
     merged["Accept"] = "*/*"
     # No gzip in v1; require identity from peers.
     merged["Accept-Encoding"] = "identity"
-    # No keep-alive in v1 — one socket per request.  The peer will
-    # close after the response; our parser uses that as the
-    # end-of-body sentinel when no Content-Length is present.
+    # No keep-alive in v1: the peer's close is the end-of-body sentinel
+    # when no Content-Length is present.
     merged["Connection"] = "close"
     if body is not None:
         merged["Content-Length"] = str(len(body))
@@ -502,10 +334,6 @@ def encode_request(
         for name, value in iterable:
             merged[name] = value
 
-    # Reject request-splitting bytes (CR / LF / NUL) and any non-ASCII
-    # in a request-line or header component before encoding — the
-    # encoder below is ASCII-only, and non-ASCII input encodes
-    # differently on CPython vs MicroPython.
     _reject_unsafe_chars("method", method)
     _reject_unsafe_chars("path", path)
     parts = [f"{method} {path} HTTP/1.1\r\n".encode("ascii")]
@@ -519,24 +347,8 @@ def encode_request(
     return b"".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Response parsing
-# ---------------------------------------------------------------------------
-
-
 class ParseState:
-    """Streaming response parser states.
-
-    Forward-only.  Two body framings::
-
-      STATUS -> HEADERS -> BODY            -> DONE   (Content-Length / read-until-close)
-      STATUS -> HEADERS -> CHUNK_SIZE
-                            -> CHUNK_DATA
-                            -> CHUNK_SIZE  (loop)
-                            -> CHUNK_TRAILER
-                            -> DONE                  (Transfer-Encoding: chunked)
-                                              \\-> ERROR (any state)
-    """
+    """Streaming response parser states."""
 
     STATUS = "status"
     HEADERS = "headers"
@@ -549,31 +361,7 @@ class ParseState:
 
 
 class ResponseParser:
-    """Streaming HTTP/1.1 response parser.
-
-    Fed raw bytes via :meth:`feed`; the state advances as soon as
-    enough bytes have arrived.  Callers check :attr:`state` to know
-    whether to keep feeding (anything other than ``DONE``/``ERROR``)
-    or stop (``DONE``).
-
-    Body framing:
-
-    * ``Content-Length: N`` — read exactly N bytes.
-    * ``Transfer-Encoding: chunked`` — RFC 7230 §4.1 chunked decode.
-      Chunk-extensions and trailers are accepted and discarded.
-    * Neither header — read until the peer closes (signaled by
-      :meth:`feed_eof`).
-
-    The ``max_body_bytes`` cap is enforced incrementally — once total
-    body bytes pass the cap the parser raises (or drops, depending on
-    *when_oversized*) on the first :meth:`feed` past the threshold.
-
-    With ``stream_body=True`` the body is not accumulated at all:
-    decoded bytes wait in a fixed staging window the consumer drains
-    via :meth:`read_body_into`, the feeder bounds each :meth:`feed` by
-    :meth:`body_free`, and ``max_body_bytes`` does not apply (the
-    window is the RAM bound).
-    """
+    """Streaming HTTP/1.1 response parser."""
 
     def __init__(
         self,
@@ -584,36 +372,14 @@ class ResponseParser:
         body_buffer_view: memoryview | None = None,
         stream_body: bool = False,
     ) -> None:
-        """Construct a one-shot parser.
+        """Construct the parser.
 
         Args:
-            max_body_bytes: Hard cap on body size — bigger triggers the
-                ``WhenOversized`` policy.  Not applied when
-                *stream_body* is set: the staging window is the bound.
-            max_header_bytes: Hard cap on the accumulated status-line +
-                header (and chunk-frame) bytes staged before the body;
-                exceeding it fails with :class:`HttpProtocolError` so a
-                peer can't grow the staging buffer without bound.
-            body_buffer: Optional caller-owned ``bytearray`` to use as
-                the steady-state body buffer.  When provided (typically
-                by ``HttpClient`` so the buffer survives across requests),
-                the parser writes into it for any response that fits
-                and rebinds to a geometrically-grown replacement when a
-                write would overflow.  When ``None``, the parser starts with
-                an empty bytearray and grows on demand — fine for
-                one-shot users, but per-request churn for long-lived
-                clients.
-            body_buffer_view: Pre-cached ``memoryview(body_buffer)``
-                supplied by the caller to avoid the parser constructing
-                one.  Required when ``body_buffer`` is provided.
-            stream_body: When ``True``, the body buffer becomes a
-                fixed-capacity staging window instead of a whole-body
-                accumulator: decoded body bytes wait in it until the
-                consumer copies them out via :meth:`read_body_into`,
-                and the feeder must bound each :meth:`feed` by
-                :meth:`body_free` (overflowing the window latches an
-                :class:`HttpError`).  A ``None`` *body_buffer* gets a
-                fresh ``DEFAULT_STREAM_BUFFER_SIZE`` window.
+            max_body_bytes: Cap on the buffered body size; ignored when *stream_body* is set.
+            max_header_bytes: Cap on status-line and header bytes staged before the body.
+            body_buffer: Optional caller-owned ``bytearray`` reused as the body buffer.
+            body_buffer_view: Pre-cached ``memoryview(body_buffer)``; required with *body_buffer*.
+            stream_body: When ``True``, stage the body in a fixed window instead of buffering whole.
         """
         self._max_body_bytes = max_body_bytes
         self._max_header_bytes = max_header_bytes
@@ -621,23 +387,12 @@ class ResponseParser:
         if stream_body and body_buffer is None:
             body_buffer = bytearray(DEFAULT_STREAM_BUFFER_SIZE)
         self._buffer = bytearray()
-        # Read cursor into ``_buffer``.  Each ``_consume(n)`` advances
-        # the cursor and only compacts the bytearray when at least
-        # half of it has been consumed, amortizing the copy across
-        # many small reads.
         self._read_offset = 0
         self.state = ParseState.STATUS
         self.status_code = None
         self.reason = ""
         self.http_version = ""
         self.headers = CaseInsensitiveDict()
-        # Body buffer: caller-supplied (HttpClient passes its long-
-        # lived buffer for cross-request reuse) or self-allocated
-        # (standalone use).  Either way ``_body`` is the active
-        # buffer and ``_body_view`` the cached memoryview.  When a
-        # write would exceed current capacity, _absorb_body_chunk
-        # rebinds ``_body`` to a geometrically-grown replacement
-        # that gets freed when the parser is dereferenced.
         if body_buffer is not None:
             if body_buffer_view is None:
                 body_buffer_view = memoryview(body_buffer)
@@ -645,108 +400,56 @@ class ResponseParser:
             self._body_view = body_buffer_view
             self._body_capacity = len(body_buffer)
         else:
-            # No external buffer: start empty and let the absorb path
-            # grow the body on demand (geometric growth in
-            # _absorb_body_chunk).  Long-lived consumers pass
-            # body_buffer instead so the steady-state buffer is
-            # reused across requests instead of reallocated per-parser.
             self._body = bytearray()
             self._body_view = memoryview(self._body)
             self._body_capacity = 0
         self._body_write_offset = 0
-        # Streamed-body read cursor into the staging window.  Body
-        # bytes between the read and write cursors are decoded but not
-        # yet handed to the consumer; both reset to 0 on a full drain.
-        # Unused (always 0) in whole-body mode.
         self._body_read_offset = 0
-        #: ``True`` once the final (non-1xx) response's header block
-        #: has been fully parsed — status line, headers, and body
-        #: framing decided.  Stays ``False`` across discarded 1xx
-        #: interim responses.
+        #: ``True`` once the final (non-1xx) response's headers are parsed.
         self.headers_complete = False
-        # -1 = unknown (read until close).  Set to a non-negative
-        # value when Content-Length parses successfully.
+        # -1 = length unknown (read until close).
         self._body_remaining = -1
-        # Bytes left in the current chunk (chunked decode only).
         self._chunk_remaining = 0
         self.error = None
 
-    # ------------------------------------------------------------------
-    # Buffer helpers (read-cursor pattern)
-    # ------------------------------------------------------------------
-
     def _live_len(self):
-        """Number of unconsumed bytes in ``_buffer``."""
         return len(self._buffer) - self._read_offset
 
     def _live_find(self, target):
-        """``find`` *target* in the unconsumed region; returns relative position or -1."""
         position = self._buffer.find(target, self._read_offset)
         if position == -1:
             return -1
         return position - self._read_offset
 
     def _live_slice(self, start, end=None):
-        """Slice of unconsumed data.  Indices are relative to the cursor."""
         absolute_start = self._read_offset + start
         if end is None:
             return self._buffer[absolute_start:]
         return self._buffer[absolute_start:absolute_start + end]
 
     def _consume(self, count):
-        """Advance the read cursor by *count* bytes; compact when the cursor
-        passes the halfway mark.
-
-        Compaction uses slice-assign-empty (``self._buffer[:offset] = b""``),
-        an in-place memmove on every runtime — no allocation, no realloc.
-        """
         self._read_offset += count
         if self._read_offset > 0 and self._read_offset * 2 >= len(self._buffer):
+            # slice-assign-empty is an in-place memmove on every runtime:
+            # no alloc, no realloc.
             self._buffer[:self._read_offset] = b""
             self._read_offset = 0
 
     def _reset_buffer(self):
-        """Drop every buffered byte and reset the cursor."""
         self._buffer = bytearray()
         self._read_offset = 0
 
-    # ------------------------------------------------------------------
-    # Public observation
-    # ------------------------------------------------------------------
-
     @property
     def body(self):
-        """Body bytes received so far (final once :attr:`state` is ``DONE``).
-
-        Reads through the cached ``_body_view`` (zero-copy memoryview
-        slice) and snapshots one ``bytes`` copy for the caller —
-        ``Response.text`` calls ``.decode()`` on the result, which
-        memoryview lacks.  In streamed-body mode this is only the
-        staged, not-yet-consumed window, not the whole body.
-        """
+        """Body bytes received so far (final once :attr:`state` is ``DONE``)."""
         return bytes(self._body_view[self._body_read_offset:self._body_write_offset])
 
     def body_free(self):
-        """Writable staging space in the streamed-body window, in bytes.
-
-        The feeder must keep each :meth:`feed` at or under this value
-        (decoded body bytes never exceed the wire bytes fed, for any
-        of the three framings), so the window can never overflow.
-        Meaningful in streamed-body mode; whole-body mode grows on
-        demand instead.
-        """
+        """Writable staging space in the streamed-body window, in bytes."""
         return self._body_capacity - self._body_write_offset
 
     def read_body_into(self, buffer):
-        """Copy staged body bytes into caller-owned *buffer*; return the count.
-
-        Copies up to ``len(buffer)`` bytes from the staging window via
-        slice-assign (no allocation) and advances the read cursor.
-        Returns ``0`` when nothing is staged.  A full drain resets both
-        cursors so the whole window is writable again — the producer
-        stalls (``body_free() == 0``) until the consumer drains, rather
-        than paying a compaction copy.
-        """
+        """Copy staged body bytes into caller-owned *buffer*; return the count."""
         available = self._body_write_offset - self._body_read_offset
         if available <= 0:
             return 0
@@ -764,41 +467,20 @@ class ResponseParser:
         return count
 
     def discard_body(self):
-        """Drop every staged body byte and reset both cursors.
-
-        Used for response bodies that are decoded but never delivered —
-        a redirect hop's body in streamed mode.
-        """
+        """Drop every staged body byte and reset both cursors."""
         self._body_read_offset = 0
         self._body_write_offset = 0
 
-    # ------------------------------------------------------------------
-    # Driving the parser
-    # ------------------------------------------------------------------
-
     def feed(self, chunk):
-        """Append *chunk* to the parser's buffer and advance the state.
-
-        A protocol / oversize failure latches :attr:`state` to ``ERROR``
-        and stores the exception on :attr:`error` rather than raising
-        here — the driving client checks the state and re-raises
-        :attr:`error`.  (The three non-ASCII line-decode failures are the
-        only paths that raise directly, for the client's request-line
-        error path.)
-        """
+        """Append *chunk* to the parser's buffer and advance the state."""
         if self.state in (ParseState.DONE, ParseState.ERROR):
             return
         if chunk:
             if self.state == ParseState.BODY:
-                # Skip the staging buffer for length-known/-unknown body
-                # bytes — straight in.  Chunked decode flows through the
-                # state machine via _buffer because each chunk is framed.
                 self._absorb_body_bytes(chunk)
             else:
-                # Pre-body states (status line, headers, chunk framing)
-                # stage into _buffer.  Cap the live accumulation so a
-                # peer dribbling bytes with no CRLF can't grow it until
-                # the heap is exhausted.
+                # Cap accumulation so a peer dribbling headerless bytes
+                # can't exhaust the heap.
                 live = len(self._buffer) - self._read_offset
                 if live + len(chunk) > self._max_header_bytes:
                     self._fail(HttpProtocolError(
@@ -810,20 +492,13 @@ class ResponseParser:
         self._advance()
 
     def feed_eof(self):
-        """Signal that the peer closed the connection.
-
-        For a ``Content-Length``-framed response this is a protocol
-        error if the body was short.  For a length-unknown response
-        (no ``Content-Length``, no ``Transfer-Encoding``) this is the
-        normal end-of-body signal.  Mid-chunk it's always an error —
-        chunked encoding is self-terminating.
-        """
+        """Signal that the peer closed the connection."""
         if self.state == ParseState.DONE:
             return
         if self.state == ParseState.ERROR:
             return
         if self.state == ParseState.BODY and self._body_remaining < 0:
-            # Length-unknown body; peer-close == done.
+            # Length-unknown body: peer close is the end-of-body signal.
             self.state = ParseState.DONE
             return
         if self.state == ParseState.BODY and self._body_remaining > 0:
@@ -839,17 +514,11 @@ class ResponseParser:
                 f"peer closed mid-chunked-body (state={self.state})",
             ))
             return
-        # Mid-headers or mid-status — peer hung up before responding.
         self._fail(HttpProtocolError(
             f"peer closed before response completed (state={self.state})",
         ))
 
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
     def _advance(self):
-        """Consume buffered bytes until no more progress is possible."""
         while True:
             if self.state == ParseState.STATUS:
                 if not self._try_parse_status_line():
@@ -871,10 +540,9 @@ class ResponseParser:
                 if not self._try_parse_chunk_trailer():
                     return
                 continue
-            return  # BODY (handled in feed) / DONE / ERROR
+            return  # BODY handled in feed; DONE / ERROR terminal.
 
     def _try_parse_status_line(self):
-        """Consume one status line; return True if state advanced."""
         crlf_index = self._live_find(CRLF)
         if crlf_index == -1:
             return False
@@ -911,13 +579,11 @@ class ResponseParser:
         return True
 
     def _try_parse_headers(self):  # noqa: CHU027 - same primitive in chumicro-http-server _wire.py; per-consumer duplication kept intentionally
-        """Consume one header line; return True if state advanced or
-        another header was parsed."""
         crlf_index = self._live_find(CRLF)
         if crlf_index == -1:
             return False
         if crlf_index == 0:
-            # Empty line — end of headers.
+            # Empty line: end of headers.
             self._consume(2)
             self._enter_body_state()
             return True
@@ -942,12 +608,8 @@ class ResponseParser:
         return True
 
     def _enter_body_state(self):
-        """Headers-complete: figure out body framing."""
-        # A 1xx interim response (100 Continue, 103 Early Hints, ...) is
-        # not the final response: discard its status/headers and parse
-        # the next status line.  101 Switching Protocols is terminal
-        # here (this client issues no Upgrade), so it falls through to
-        # the no-body path.
+        # A 1xx interim response is not final: discard it and read the
+        # next status line. 101 is terminal here (no Upgrade issued).
         if 100 <= self.status_code < 200 and self.status_code != 101:
             self.status_code = None
             self.reason = ""
@@ -959,15 +621,10 @@ class ResponseParser:
         if self.status_code in NO_BODY_STATUS_CODES:
             self.state = ParseState.DONE
             return
-        # Transfer-Encoding takes precedence over Content-Length per
-        # RFC 7230 §3.3.3 — when both are present, the framing is
-        # chunked and Content-Length is informational only.
+        # Transfer-Encoding takes precedence over Content-Length
+        # (RFC 7230 §3.3.3).
         transfer_encoding = self.headers.get("Transfer-Encoding")
         if transfer_encoding is not None:
-            # We accept "chunked" as the final (or only) coding.  Other
-            # transfer codings (gzip, deflate, identity stacked with
-            # chunked) aren't supported in v1 — reject as protocol error
-            # so the caller doesn't silently get garbled bytes.
             normalized = transfer_encoding.replace(" ", "").lower()
             if normalized != "chunked":
                 self._fail(HttpProtocolError(
@@ -1004,29 +661,18 @@ class ResponseParser:
                 return
             self.state = ParseState.BODY
             self._body_write_offset = 0
-            # Pre-allocate the full body once when it won't fit the
-            # steady-state buffer.  content_length is already capped at
-            # max_body_bytes above, so this allocation is bounded — and
-            # it spares this known-length path even the amortized copies
-            # the chunked / length-unknown grow path pays (which doubles
-            # capacity, O(log n) reallocations, O(n) total copy).  A
-            # response that fits the caller's body_buffer still completes
-            # with no per-request allocation.  Streamed mode never
-            # pre-allocates: the fixed staging window plus consumer
-            # drains is the whole point of that mode, so a peer-sized
-            # allocation here would defeat it.
+            # Pre-allocate the whole (capped) body when it won't fit the
+            # steady-state buffer. Streamed mode never pre-allocates.
             if content_length > self._body_capacity and not self._stream_body:
                 self._body = bytearray(content_length)
                 self._body_view = memoryview(self._body)
                 self._body_capacity = content_length
-            # Any bytes left in the buffer after the header CRLF are
-            # the start of the body — flush into the body absorber.
+            # Bytes after the header CRLF are the start of the body.
             if self._live_len() > 0:
                 tail_view = self._live_slice(0)
                 self._reset_buffer()
                 self._absorb_body_bytes(tail_view)
             return
-        # Length-unknown — read until peer closes.
         self._body_remaining = -1
         self.state = ParseState.BODY
         if self._live_len() > 0:
@@ -1035,15 +681,6 @@ class ResponseParser:
             self._absorb_body_bytes(tail)
 
     def _try_parse_chunk_size(self):
-        """Consume one chunk-size line; return True if state advanced.
-
-        Format per RFC 7230 §4.1.1::
-
-            chunk-size [ ";" chunk-ext ] CRLF
-
-        chunk-extensions are accepted and ignored.  A size of 0 marks
-        the last-chunk and transitions to CHUNK_TRAILER.
-        """
         crlf_index = self._live_find(CRLF)
         if crlf_index == -1:
             return False
@@ -1077,10 +714,8 @@ class ResponseParser:
                 f"negative chunk-size: {chunk_size}",
             ))
             return True
-        # Enforce the max-body cap as the chunk sizes accumulate so a
-        # malicious server can't trickle in 64K + 1B before we notice.
-        # Streamed mode has no body cap (the staging window bounds RAM,
-        # and the write offset is a cursor there, not a running total).
+        # Enforce the max-body cap as chunk sizes accumulate so a server
+        # can't trickle past it. Streamed mode's bound is the window.
         if not self._stream_body and self._body_write_offset + chunk_size > self._max_body_bytes:
             self._fail(HttpOversizedError(
                 f"chunked body would exceed cap {self._max_body_bytes}",
@@ -1090,22 +725,11 @@ class ResponseParser:
         if chunk_size == 0:
             self.state = ParseState.CHUNK_TRAILER
             return True
-        # No upfront body alloc needed — the steady-state buffer is
-        # already in place from :meth:`__init__`.  Chunks that fit
-        # write in place; chunks that overflow trigger a one-shot
-        # grow in :meth:`_try_consume_chunk_data`.
         self._chunk_remaining = chunk_size
         self.state = ParseState.CHUNK_DATA
         return True
 
     def _try_consume_chunk_data(self):
-        """Consume up to ``_chunk_remaining`` bytes + the trailing CRLF.
-
-        Returns True when state advances (data fully consumed +
-        terminating CRLF parsed) so :meth:`_advance` keeps walking.
-        Returns False when there's not enough buffered to make
-        progress — caller waits for the next :meth:`feed`.
-        """
         if self._chunk_remaining > 0:
             available = min(self._chunk_remaining, self._live_len())
             if available == 0:
@@ -1114,18 +738,14 @@ class ResponseParser:
                 self._read_offset:self._read_offset + available
             ]
             self._absorb_body_chunk(source)
-            # Drop the memoryview before _consume's in-place compaction.
-            # CPython refuses to resize a bytearray with active exports
-            # (BufferError); releasing the view here lets _consume's
-            # slice-assign-empty memmove run.  MicroPython / CircuitPython
-            # don't track exports, so this is defensive on those runtimes.
+            # Drop the memoryview before _consume compacts: CPython
+            # refuses to resize a bytearray with active exports.
             source = None
             self._consume(available)
             self._chunk_remaining -= available
             if self._chunk_remaining > 0:
                 return False
-        # Chunk data exhausted; expect a terminating CRLF before the
-        # next chunk-size line.
+        # Chunk data is followed by a terminating CRLF.
         if self._live_len() < 2:
             return False
         tail = self._live_slice(0, 2)
@@ -1139,33 +759,19 @@ class ResponseParser:
         return True
 
     def _try_parse_chunk_trailer(self):
-        """Consume optional trailer header lines until the empty CRLF.
-
-        v1 ignores trailer values — they're rare and most consumers
-        don't care.  When the empty line arrives the body is complete
-        and we transition to DONE.
-        """
         crlf_index = self._live_find(CRLF)
         if crlf_index == -1:
             return False
         if crlf_index == 0:
-            # Empty trailer line — end of chunked body.
+            # Empty trailer line: end of chunked body.
             self._consume(2)
             self.state = ParseState.DONE
             return True
-        # Non-empty trailer line — discard (RFC 7230 §4.1.2 lets us
-        # ignore trailers we don't recognize).
+        # Discard trailer lines (RFC 7230 §4.1.2 permits ignoring them).
         self._consume(crlf_index + 2)
         return True
 
     def _absorb_body_bytes(self, chunk):
-        """Append body bytes; honor the length cap and oversize policy.
-
-        Dispatches on body framing: Content-Length-known clamps the
-        write to the remaining count and transitions to DONE when
-        filled, length-unknown enforces the max-body cap as bytes
-        arrive.  The actual write is delegated to _absorb_body_chunk.
-        """
         if self._body_remaining == 0:
             return  # Already complete; ignore extra bytes (server bug).
         if self._body_remaining > 0:
@@ -1175,8 +781,7 @@ class ResponseParser:
             if self._body_remaining == 0:
                 self.state = ParseState.DONE
             return
-        # Length-unknown: enforce the max-body cap as we go (whole-body
-        # mode only — streamed mode's bound is the staging window).
+        # Length-unknown: enforce the max-body cap as bytes arrive.
         chunk_len = len(chunk)
         if not self._stream_body and self._body_write_offset + chunk_len > self._max_body_bytes:
             self._fail(HttpOversizedError(
@@ -1187,55 +792,28 @@ class ResponseParser:
         self._absorb_body_chunk(chunk)
 
     def _absorb_body_chunk(self, chunk):
-        """Write *chunk* at the current body write cursor.
-
-        Slice-assign when the write fits inside the current body
-        capacity (the steady-state path when an external buffer was
-        supplied), or grow the buffer geometrically and copy into the
-        replacement when it doesn't (chunked / length-unknown grow
-        path, where no total is known to pre-size against).  In
-        streamed-body mode the buffer never grows — an overflow latches
-        an :class:`HttpError` instead.  Never uses ``bytearray.extend``
-        — that's "alloc bigger + memcpy old + memcpy new + free old" on
-        CP / MP, three allocations per logical write.
-        """
         chunk_len = len(chunk)
         write_offset = self._body_write_offset
         end_offset = write_offset + chunk_len
         if end_offset <= len(self._body_view):
-            # Fits inside current capacity — in-place slice-assign.
             self._body[write_offset:end_offset] = chunk
         elif self._stream_body:
-            # The staging window is a hard bound: the feeder is required
-            # to keep each feed at or under body_free(), so this branch
-            # only fires on a mis-driven standalone parser.  Latch loudly
-            # rather than grow — growth would silently unbound the RAM
-            # cost streaming exists to fix.
+            # The staging window is a hard bound; this only fires on a
+            # mis-driven parser.
             self._fail(HttpError(
                 "streamed-body staging overflow: drain read_body_into "
                 "and bound each feed by body_free()",
             ))
             return
         else:
-            # Grow path (chunked / length-unknown framing — no total is
-            # known up front, so the Content-Length pre-alloc can't
-            # apply).  Grow capacity geometrically: double the current
-            # buffer, floored at what this write needs and capped at
-            # ``max_body_bytes``.  Exact-size regrowth per overflow
-            # re-copied the whole body-so-far on every chunk (O(n^2)
-            # over a streamed body); doubling amortizes total copying to
-            # O(n).  Capacity past ``_body_write_offset`` is never read
-            # (``body`` slices to the write offset), so the bytes handed
-            # back are byte-for-byte unchanged.  The caller's external
-            # buffer (if any) is left untouched — ``_body`` rebinds to
-            # the replacement.
+            # Double the capacity (amortized O(n) vs exact-regrow O(n^2)),
+            # floored at this write and capped at max_body_bytes.
             new_capacity = len(self._body_view) * 2
             if new_capacity < end_offset:
                 new_capacity = end_offset
             if new_capacity > self._max_body_bytes:
-                # Callers cap end_offset at max_body_bytes before we run,
-                # so clamping here only trims the doubling's overshoot; it
-                # never drops below what this write needs.
+                # Safe because callers cap end_offset at max_body_bytes;
+                # this only trims the doubling overshoot.
                 new_capacity = self._max_body_bytes
             new_body = bytearray(new_capacity)
             new_body[:write_offset] = self._body_view[:write_offset]
@@ -1246,6 +824,5 @@ class ResponseParser:
         self._body_write_offset = end_offset
 
     def _fail(self, error):
-        """Latch *error* and transition to ERROR."""
         self.error = error
         self.state = ParseState.ERROR

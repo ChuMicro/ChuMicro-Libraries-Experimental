@@ -1,13 +1,4 @@
-"""Core ``KVStore`` class, exception hierarchy, and ``Backend`` ABC.
-
-``MemoryBackend`` is lazy-imported on the two paths that touch it
-(the CPython fall-through and ``backend="memory"``), keeping ~700 B
-of heap off device-runtime imports.  ``msgpack`` stays at module
-top: it runs on every commit/load and lazy overhead would dominate.
-``Backend`` lives alongside the exceptions so backends import their
-ABC + exception classes from one place, breaking the cycle that
-would otherwise require per-method lazy imports.
-"""
+"""Core ``KVStore`` class, exception hierarchy, and ``Backend`` ABC."""
 
 import sys
 
@@ -19,43 +10,17 @@ class KVStoreError(Exception):
 
 
 class KVStoreFull(KVStoreError):
-    """A commit would exceed ``capacity``.
-
-    The store's in-memory state is unchanged; callers that catch this
-    typically remove a key and retry.
-    """
+    """A commit would exceed ``capacity``; the in-memory state is left unchanged."""
 
 
 class KVStoreCorrupt(KVStoreError):
-    """Persisted state failed integrity check on load.
-
-    Raised from explicit ``reload()`` only. Auto-load on construction
-    surfaces corruption via the ``is_corrupt`` property and resets the
-    store to empty so the app can keep running.
-    """
+    """Persisted state failed its integrity check on load."""
 
 
 class Backend:
-    """Backend protocol every concrete backend implements.
+    """Interface that every concrete backend implements."""
 
-    A backend is a thin shim around the substrate-specific persistence
-    mechanism (CP NVM byte slab, MP NVS namespace, MP LittleFS file,
-    in-memory dict).  It deals in ``bytes`` payloads; the msgpack
-    codec lives in ``KVStore``, so backends never decode.
-
-    ``load()`` returns the persisted bytes (``b""`` for a blank
-    substrate) and raises ``KVStoreCorrupt`` on integrity-check failure
-    (CP NVM raises this on CRC mismatch, for example).  ``save(payload)``
-    overwrites the persisted state and raises ``KVStoreFull`` if the
-    substrate can't accept that many bytes.
-
-    ``capacity`` is honored by ``KVStore`` *before* ``save`` is called,
-    so backends only need to enforce it as a defensive last line.
-    ``name`` is the stable identifier surfaced by
-    ``KVStore.backend_name``.  Kept as a class rather than a
-    ``Protocol`` because MicroPython has no ``typing`` module.
-    """
-
+    # A plain class, not typing.Protocol: MicroPython has no typing module.
     name: str = "base"
     capacity: int = 0
 
@@ -67,11 +32,6 @@ class Backend:
 
 
 def _select_backend() -> Backend:
-    """Pick the best backend for this runtime.
-
-    CP / MP branches are exercised by per-runtime functional suites
-    under ``functional_tests/``; CPython tests can't reach them.
-    """
     runtime_name = sys.implementation.name
     if runtime_name == "circuitpython":  # pragma: no cover - CP runtime path
         from chumicro_kvstore._backends.cp_nvm import CpNvmBackend  # noqa: PLC0415
@@ -84,13 +44,11 @@ def _select_backend() -> Backend:
             return MpLittlefsBackend()
         from chumicro_kvstore._backends.mp_nvs import MpNvsBackend  # noqa: PLC0415
         return MpNvsBackend()
-    # CPython fall-through.
     from chumicro_kvstore._backends.memory import MemoryBackend  # noqa: PLC0415
     return MemoryBackend()
 
 
 def _resolve_backend(backend: Backend | str) -> Backend:
-    """Coerce a backend argument to a concrete instance."""
     if not isinstance(backend, str):
         return backend
     if backend == "auto":
@@ -114,9 +72,7 @@ class KVStore:
     """Persisted key-value store with a mapping-style public API.
 
     Args:
-        backend: Backend selection — ``"auto"`` (default; per-runtime
-            choice), ``"memory"``, ``"nvm"``, ``"nvs"``, ``"littlefs"``,
-            or a concrete backend instance for tests.
+        backend: ``"auto"``, ``"memory"``, ``"nvm"``, ``"nvs"``, ``"littlefs"``, or a backend instance.
     """
 
     def __init__(self, backend: Backend | str = "auto") -> None:
@@ -126,26 +82,10 @@ class KVStore:
         self._data: dict[str, object] = {}
         self._last_payload: bytes = b""
         self.is_corrupt: bool = False
-        # Set by the mapping mutators, cleared on persist / (re)load.
-        # ``commit_if_changed`` skips the encode entirely when clean, so
-        # the guide-blessed every-tick schedule allocates nothing in the
-        # steady no-change state.
         self._dirty: bool = False
         self._auto_load()
 
-    # --- lifecycle -------------------------------------------------
-
     def _auto_load(self) -> None:
-        """Read backend on construction; reset to empty on corruption.
-
-        Construction-time corruption never raises. Surfacing would force
-        the caller to handle a "store is broken" path before the app can
-        even start.  Instead, the store reports the event via
-        ``is_corrupt`` and behaves as empty.  ``reload()`` is the
-        explicit form that callers use when they want the exception.
-        """
-        # Loading (re)synchronizes with the backend, so nothing is
-        # pending afterward regardless of which branch we take.
         self._dirty = False
         try:
             payload = self._backend.load()
@@ -161,10 +101,6 @@ class KVStore:
         try:
             loaded = unpackb(payload)
         except ValueError:
-            # unpackb raises ValueError on malformed framing (truncated,
-            # over-length, trailing, too-deep).  Treat that the same as a
-            # non-dict payload: report corruption, behave empty, never
-            # raise at construction.
             loaded = None
         if not isinstance(loaded, dict):
             self._data = {}
@@ -181,7 +117,7 @@ class KVStore:
             KVStoreCorrupt: Backend payload failed integrity check.
         """
         self._dirty = False
-        payload = self._backend.load()  # may raise KVStoreCorrupt
+        payload = self._backend.load()
         if not payload:
             self._data = {}
             self._last_payload = b""
@@ -206,14 +142,10 @@ class KVStore:
         self._persist(packb(self._data))
 
     def commit_if_changed(self) -> bool:
-        """Commit only if the encoded payload differs from last persisted.
+        """Commit only when the encoded payload changed since the last persist.
 
-        First-line wear defense for raw-flash backends.  Returns
-        ``True`` when a write happened, ``False`` when skipped.  Skips
-        the encode entirely when no mapping mutator ran since the last
-        persist, so scheduling it every tick costs nothing while the
-        data is unchanged.  A nested value mutated in place without a
-        mapping call (outside the documented API) won't be seen.
+        Returns:
+            ``True`` if a write happened, ``False`` if the commit was skipped.
         """
         if not self._dirty:
             return False
@@ -225,11 +157,7 @@ class KVStore:
         return True
 
     def _persist(self, payload: bytes) -> None:
-        """Capacity-check + save + state update, shared by both commit paths."""
-        # capacity <= 0 means "unbounded" (the Backend base default), so
-        # a custom backend that only implements load/save isn't blocked
-        # by a spurious zero cap that even an empty dict's 1-byte payload
-        # would exceed.
+        # capacity 0 (the Backend default) means unbounded, not a zero limit.
         if 0 < self.capacity < len(payload):
             raise KVStoreFull(
                 f"payload size {len(payload)} exceeds capacity {self.capacity}"
@@ -238,8 +166,6 @@ class KVStore:
         self._last_payload = payload
         self.is_corrupt = False
         self._dirty = False
-
-    # --- mapping-style API -----------------------------------------
 
     def __getitem__(self, key: str) -> object:
         return self._data[key]
@@ -274,12 +200,7 @@ class KVStore:
         return self._data.values()
 
     def pop(self, key: str, *default: object) -> object:
-        """Remove *key* and return its value; fall back to *default* if given.
-
-        The variadic *default lets the caller distinguish "no default
-        supplied" (raise ``KeyError`` on missing) from "default is
-        ``None``"; same idiom as ``dict.pop``.
-        """
+        """Remove *key* and return its value, or *default* when supplied."""
         self._dirty = True
         if default:
             return self._data.pop(key, default[0])
@@ -295,15 +216,7 @@ class KVStore:
         self._data.update(other)
         self._dirty = True
 
-    # --- introspection ---------------------------------------------
-
     @property
     def bytes_used(self) -> int:
-        """Encoded size of the *current* in-memory dict (not the persisted payload).
-
-        Allocates a full msgpack encode of the dict on every read just to
-        measure its length, and is not memoized — so read it sparingly.
-        A "how full am I?" gauge polled each tick pays the encode plus a
-        transient full-payload allocation on every call.
-        """
+        """Encoded size of the current in-memory dict, not the persisted payload."""
         return len(packb(self._data))

@@ -1,16 +1,4 @@
-"""Pre-baked broker responses and client fixtures for unit tests.
-
-Tests typically drive an MQTTClient via a
-:class:`chumicro_sockets.testing.FakeSocket`.  Script broker responses
-with ``sock.enqueue_recv(canned_connack_bytes())`` etc., let the
-client tick, then assert the wire format on ``sock.sent``.
-
-The canned-bytes helpers stay in sync with the encoder/decoder so a
-hand-rolled byte literal in a test doesn't drift when the wire format
-gets a tweak.  ``new_client`` + ``drive`` package the common
-"FakeSocket + FakeTicks + sensible defaults" construction so cross-
-runtime test files don't each carry their own copy.
-"""
+"""Pre-baked broker responses and client fixtures for unit tests."""
 
 __chumicro_test_support__ = True
 
@@ -23,11 +11,8 @@ def canned_connack_bytes(*, return_code: int = 0, session_present: bool = False)
     """Return the four-byte CONNACK packet for *return_code*.
 
     Args:
-        return_code: 0 = accepted.  1-5 = various rejection reasons
-            per MQTT 3.1.1 §3.2.2.3.  Tests for the rejection path
-            pass non-zero here.
-        session_present: Bit 0 of the ack flags byte.  ``True`` only
-            on a clean_session=False resume.
+        return_code: 0 = accepted; 1-5 = rejection reasons (MQTT 3.1.1 §3.2.2.3).
+        session_present: Bit 0 of the ack flags byte.
     """
     flags = 0x01 if session_present else 0x00
     return bytes((0x20, 0x02, flags, return_code))
@@ -71,7 +56,7 @@ def canned_publish_bytes(topic, payload, *, qos=0, retain=False, packet_id=None)
             raise ValueError("QoS > 0 PUBLISH requires a packet_id")
         variable_header += struct.pack(">H", packet_id)
     body = variable_header + payload
-    # Variable-length encoding for body length.
+    # Variable-length encoding of the body length.
     remaining_bytes = bytearray()
     value = len(body)
     while True:
@@ -86,12 +71,7 @@ def canned_publish_bytes(topic, payload, *, qos=0, retain=False, packet_id=None)
 
 
 def new_client(sock, ticks, **overrides):
-    """Build an MQTTClient against *sock* and *ticks* with test defaults.
-
-    Defaults: ``client_id="test-client"``, ``keep_alive_seconds=60``,
-    ``ack_timeout_seconds=5.0``, ``publish_retry_max=2``.  Any keyword
-    in *overrides* wins over the default of the same name.
-    """
+    """Build an MQTTClient against *sock* and *ticks* with test defaults."""
     kwargs = {
         "client_id": "test-client",
         "keep_alive_seconds": 60,
