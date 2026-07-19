@@ -4,14 +4,42 @@
 
 `chumicro-requests` is a non-blocking HTTP/1.1 client built on `chumicro-sockets`.  `HttpClient` is the single entry point for every verb — its `check(now_ms)` / `handle(now_ms)` methods drive the request forward one tick at a time.  An LED keeps blinking on the same board while a request is in flight or mid-timeout against a stalled peer.  Two connect phases are the exception: the DNS lookup, and on MicroPython / CircuitPython the TLS handshake, each block the reactor for their duration (see *Bring your own transport*).  The library is single-in-flight today — a second `client.get(...)` while another request is running raises `HttpBusyError`.
 
-## Getting started
+## Getting started with generators
+
+The generator surface runs a whole request top to bottom (connect, send, receive, return) with no handle to poll and no `on_done` callback.  A single `response = yield from get(...)` drives the request under `Runner.add_generator`, and other runner services keep getting the CPU between yields.
+
+```python
+from chumicro_requests.generators import get
+from chumicro_runner import Runner
+from chumicro_sockets.sockets_factory import connector_factory
+
+transport_factory = connector_factory(radio=wifi.radio)
+
+
+def fetch_once():
+    response = yield from get(transport_factory, "http://api.example.com/now")
+    print(response.status_code, len(response.body))
+
+
+runner = Runner()
+handle = runner.add_generator(fetch_once())
+while not handle.done:
+    now_ms = runner.tick()
+    runner.wait(now_ms)
+```
+
+`chumicro_requests.generators` also exposes `post`, `put`, `patch`, `delete`, and the lower-level `fetch(transport_factory, method, url)`.  For a body too big for RAM, `stream(...)` returns a reader you pull one chunk per `yield from` (see [Streaming large bodies](#streaming-large-bodies)).
+
+## Getting started with a service
+
+Reach for the `HttpClient` service when you make repeated requests on one client, or when you want the `check` / `handle` shape that drops straight into a `Runner` alongside other services.
 
 ```python
 from chumicro_requests import HttpClient
-from chumicro_requests.sockets_factory import chumicro_sockets_connector_factory
+from chumicro_sockets.sockets_factory import connector_factory
 from chumicro_timing import ticks_ms
 
-client = HttpClient(transport_factory=chumicro_sockets_connector_factory(radio=wifi.radio))
+client = HttpClient(transport_factory=connector_factory(radio=wifi.radio))
 handle = client.get("http://api.example.com/now", timeout_ms=5000)
 
 while not handle.done:
@@ -192,7 +220,7 @@ The `transport_factory` argument is a callable
 `(host, port, use_tls) -> SocketConnector` — a tick-driven connector,
 not a ready socket (see [Bring your own transport](#bring-your-own-transport)
 below for the connector contract). The bundled
-`chumicro_requests.sockets_factory.chumicro_sockets_connector_factory(radio=..., ssl_context=...)`
+`chumicro_sockets.sockets_factory.connector_factory(radio=..., ssl_context=...)`
 returns one wired to `chumicro-sockets`. The helper lives in an opt-in
 submodule so users with a custom transport never trigger the
 `chumicro-sockets` deploy. Tests pass a factory returning a
@@ -219,7 +247,7 @@ If you supply your own factory and want `chumicro_sockets` dropped from the depl
 __chumicro_skip_factories__ = ("sockets_factory",)
 ```
 
-The constant accepts a family form (the bare stem, matches every `chumicro_*.sockets_factory`) or an exact dotted path (`chumicro_requests.sockets_factory`).  An unmatched entry fails the deploy with a typo message rather than silently shipping the default.  Calling `HttpClient.from_config(...)` when `chumicro_requests.sockets_factory` is missing — either skipped at deploy time or not installed by `circup` / `mip` — raises `RuntimeError` naming the bypass kwarg.
+The constant accepts a family form (the bare stem, matches every `chumicro_*.sockets_factory`) or an exact dotted path (`chumicro_sockets.sockets_factory`).  An unmatched entry fails the deploy with a typo message rather than silently shipping the default.  Calling `HttpClient.from_config(...)` when `chumicro_sockets.sockets_factory` is missing — either skipped at deploy time or not installed by `circup` / `mip` — raises `RuntimeError` naming the bypass kwarg.
 
 For the full single-library adoption recipe — your transport, your `ticks=`, the runner-less drive loop, and host tests with no board — see [Standalone integration](https://github.com/ChuMicro/ChuMicro/blob/main/docs/contributing/standalone-integration.md).
 
@@ -232,9 +260,9 @@ LED-heartbeat task:
 ```python
 from chumicro_runner import Runner
 from chumicro_requests import HttpClient
-from chumicro_requests.sockets_factory import chumicro_sockets_connector_factory
+from chumicro_sockets.sockets_factory import connector_factory
 
-http_client = HttpClient(transport_factory=chumicro_sockets_connector_factory(radio=radio))
+http_client = HttpClient(transport_factory=connector_factory(radio=radio))
 runner = Runner([http_client, blink_task])
 while True:
     runner.tick(ticks_ms())
@@ -257,7 +285,7 @@ the per-request cost drops to the `stream_buffer_size` staging window
 Pure Python, no third-party deps beyond `chumicro-sockets` and `chumicro-timing`.
 Works identically on CPython, MicroPython, and CircuitPython once the
 connection factory is wired up. HTTPS uses the same
-`chumicro_requests.sockets_factory.chumicro_sockets_connector_factory(ssl_context=...)`
+`chumicro_sockets.sockets_factory.connector_factory(ssl_context=...)`
 pattern as plain HTTP.
 
 ### HTTPS heap headroom on minimum-class boards
@@ -276,7 +304,7 @@ handshake.
 
 ### TLS context — bring your own CA
 
-`chumicro_requests.sockets_factory.chumicro_sockets_connector_factory(ssl_context=...)`
+`chumicro_sockets.sockets_factory.connector_factory(ssl_context=...)`
 accepts an SSL context built via `chumicro_sockets.ssl_context_with_ca(pem)`.
 CA-pinning is required
 on both supported embedded runtimes — but for different reasons:

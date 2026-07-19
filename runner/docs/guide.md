@@ -115,6 +115,8 @@ Each call to `wait`:
 
 Errors on a registered socket (`POLLERR` / `POLLHUP`) are routed to the owning service's optional `io_error(now_ms, eventmask)` hook so the service can transition cleanly to a failure state.  `POLLIN` / `POLLOUT` are wake signals only — `check` and `next_deadline` decide what runs on the next `tick`.
 
+Not sure which wait primitive a given job wants?  The timing guide's [Choosing a wait](https://chumicro.github.io/ChuMicro/timing/stable/guide/#choosing-a-wait) table maps each question to its primitive across `chumicro_timing`, `chumicro_sockets`, and this service contract.
+
 ### Writing a service that participates in `wait`
 
 A socket-owning service exposes the duck-typed attributes the runner reads each loop.  All are optional — services without them work the same way they always did; the runner just won't wake for their I/O:
@@ -164,6 +166,37 @@ Every networked library in ChuMicro (`wifi`, `sockets`, `requests`, `http_server
 `Runner(poller=...)` accepts any object exposing `register(obj, eventmask)` / `modify(obj, eventmask)` / `unregister(obj)` / `ipoll(timeout_ms)`.  The default poller is built lazily on the first `wait()` that has a socket to register, so applications that never register an `io_socket` never pay for it.
 
 `chumicro_runner.testing.FakePoller` is the test stand-in — see [Testing tasks](#testing-tasks).
+
+## The service contract
+
+A service is any object you hand to `runner.add(service)`.  The runner reads six members off it: two are required, the rest optional, each optional member carrying a coherence rule the dispatch relies on.
+
+| Member | Required | When the runner reads it | For |
+|---|---|---|---|
+| `check(now_ms) -> bool` | yes | each `tick`, subject to any period gate | deciding whether `handle` runs this tick |
+| `handle(now_ms)` | yes | each `tick`, when `check` returned `True` | one tick of work |
+| `io_socket` | no | each `wait`, as an attribute (the socket, or `None`) | the socket to poll |
+| `io_interest(now_ms) -> int` | no | each `wait` | OR-ing `IO_READ` / `IO_WRITE` into the poll set for `io_socket` |
+| `next_deadline(now_ms) -> int \| None` | no | each `wait` | bounding the idle timeout so the service still runs on time with no I/O |
+| `io_error(now_ms, eventmask)` | no | on `wait`, when `io_socket` reports `POLLERR` / `POLLHUP` | transitioning cleanly to a failure state |
+
+The coherence rules, as the dispatch enforces them:
+
+- **`check` and `handle` are both required.**  `Runner.add` reads both off the object at registration, so a service missing either cannot register.
+- **`io_socket` and `io_interest` come as a pair.**  The poll sync reaches the socket through `io_interest`; one member without the other never reaches the poller.
+- **`io_error` requires `io_socket`.**  It is dispatched only when that socket reports a poll error.
+
+`chumicro_runner.testing.validate_service(service)` checks exactly these rules and raises `ValueError` naming the offending member.  It validates shape, never behavior, so drop it into a consumer library's test suite to catch a malformed service before it reaches a live runner:
+
+```python
+from chumicro_runner.testing import validate_service
+
+
+def test_my_service_is_a_valid_runner_service():
+    validate_service(MySensorService(...))
+```
+
+Work runs on the runner in two shapes: services, the contract above, and generators registered with `runner.add_generator`.  This section is the service side; the generator side is its own surface with its own helpers, and there is no third shape.
 
 ## Registration patterns
 

@@ -6,7 +6,42 @@
 
 QoS 2 raises `UnsupportedQoSError`.  Last-will, retained messages, wildcard topic matching, and a structured oversized-message policy are built in.
 
-## Getting started
+## Getting started with generators
+
+The receive-stream surface reads inbound messages as a linear loop: `message = yield from client.next_message()` waits for the next message, acts on it, and loops until the client parks for good.  Register the client (it does the socket I/O each tick) and the consumer generator side by side.
+
+```python
+from chumicro_mqtt import MQTTClient
+from chumicro_runner import Runner
+from chumicro_sockets.sockets_factory import fixed_connector_factory
+
+client = MQTTClient(
+    transport_factory=fixed_connector_factory("broker.example.com", 1883),
+    client_id="sensor-1",
+)
+client.subscribe("commands/+")
+client.connect()
+
+
+def consume():
+    while True:
+        message = yield from client.next_message()   # InboundPublish
+        if message is None:
+            break                                    # client parked for good
+        print(message.topic, message.payload)
+
+
+runner = Runner()
+runner.add(client)
+handle = runner.add_generator(consume())
+runner.run_until(handle)
+```
+
+`MQTTClient.from_config(config, radio=...)` wires the same `fixed_connector_factory` for you from `mqtt.broker.host` / `mqtt.broker.port` and derives a per-device `client_id`.  The first `next_message()` call switches inbound delivery from the `on_message` callback to a bounded drop-oldest queue the generator drains; pick one inbound surface per client.  See `examples/receive_stream.py`.
+
+## Getting started with a service
+
+Reach for the callback service when you fan out across topics with `on_message` and `topic_matches`, or when you drive the client from your own tick loop.
 
 ```python
 from chumicro_timing import ticks_ms
@@ -268,7 +303,7 @@ If you supply your own transport and never want `chumicro_sockets` to land on th
 __chumicro_skip_factories__ = ("sockets_factory",)
 ```
 
-The constant accepts a family form (the bare stem, matches every `chumicro_*.sockets_factory`) or an exact dotted path (`chumicro_mqtt.sockets_factory`).  An unmatched entry fails the deploy with a typo message rather than silently shipping the default.  Calling `MQTTClient.from_config(...)` when `chumicro_mqtt.sockets_factory` is missing — either skipped at deploy time or not installed by `circup` / `mip` — raises `RuntimeError` naming the bypass kwarg, so the failure mode is loud rather than mysterious.
+The constant accepts a family form (the bare stem, matches every `chumicro_*.sockets_factory`) or an exact dotted path (`chumicro_sockets.sockets_factory`).  An unmatched entry fails the deploy with a typo message rather than silently shipping the default.  Calling `MQTTClient.from_config(...)` when `chumicro_sockets.sockets_factory` is missing (skipped at deploy time, or not installed by `circup` / `mip`) raises `RuntimeError` naming the bypass kwarg, so the failure mode is loud rather than mysterious.
 
 For the full single-library adoption recipe — your transport, your `ticks=`, the runner-less drive loop, and host tests with no board — see [Standalone integration](https://github.com/ChuMicro/ChuMicro/blob/main/docs/contributing/standalone-integration.md).
 

@@ -4,16 +4,47 @@
 
 `chumicro-websockets` is a non-blocking WebSocket (RFC 6455) client + server built on `chumicro-sockets` and `chumicro-timing`.  Two top-level classes — `WebSocketClient` for outbound `ws://` / `wss://` connections, and `WebSocketServer` for inbound.  Both follow the runner pattern from `chumicro-runner` (`check(now_ms)` / `handle(now_ms)`), so an LED can keep blinking through the opening handshake, frame I/O, control-frame interleave, and the close handshake.
 
-## Getting started — client
+## Getting started with generators
+
+The receive-stream surface reads inbound messages as a linear loop: `message = yield from client.next_message()` waits for the next message, hands it back, and loops until the session closes.  Register the client (it does the frame I/O each tick) and the consumer generator side by side.
+
+```python
+from chumicro_runner import Runner
+from chumicro_sockets.sockets_factory import connector_factory
+from chumicro_websockets import WebSocketClient
+
+client = WebSocketClient(transport_factory=connector_factory(radio=wifi.adapter.radio))
+client.connect("ws://api.example.com/stream", timeout_ms=10_000)
+
+
+def receive():
+    while True:
+        message = yield from client.next_message()   # InboundMessage
+        if message is None:
+            break                                    # session closed
+        print(message.text if message.is_text else message.data)
+
+
+runner = Runner()
+runner.add(client)
+handle = runner.add_generator(receive())
+runner.run_until(handle)
+```
+
+The first `next_message()` call switches inbound delivery from the `on_text` / `on_binary` callbacks to a bounded queue the generator drains (drop-oldest); pick one inbound surface per client.  See `examples/receive_stream.py`.
+
+## Getting started with a service (client)
+
+The `check` / `handle` service shape suits callback-style consumers and any client you drive from your own tick loop.
 
 ```python
 from chumicro_websockets import WebSocketClient, WebSocketState
-from chumicro_websockets.sockets_factory import chumicro_sockets_connector_factory
+from chumicro_sockets.sockets_factory import connector_factory
 from chumicro_timing import ticks_ms
 from chumicro_wifi import wifi
 
 client = WebSocketClient(
-    transport_factory=chumicro_sockets_connector_factory(radio=wifi.adapter.radio),
+    transport_factory=connector_factory(radio=wifi.adapter.radio),
 )
 client.on_text = lambda text: print(f"got: {text}")
 client.on_close = lambda code, reason: print(f"closed {code} {reason}")
@@ -28,7 +59,7 @@ while client.state != WebSocketState.CLOSED:
         want_to_send_now = False
 ```
 
-## Getting started — server
+## Getting started with a service (server)
 
 ```python
 from chumicro_websockets import WebSocketServer
@@ -125,7 +156,7 @@ If you supply your own factory and want `chumicro_sockets` dropped from the depl
 __chumicro_skip_factories__ = ("sockets_factory",)
 ```
 
-Family form (`"sockets_factory"`, matches every `chumicro_*.sockets_factory`) or exact path (`"chumicro_websockets.sockets_factory"`).  An unmatched entry fails the deploy with a typo message rather than silently shipping the default.  Calling `WebSocketClient.from_config(...)` when `chumicro_websockets.sockets_factory` is missing — either skipped at deploy time or not installed by `circup` / `mip` — raises `RuntimeError` naming the bypass kwarg.
+Family form (`"sockets_factory"`, matches every `chumicro_*.sockets_factory`) or exact path (`"chumicro_sockets.sockets_factory"`).  An unmatched entry fails the deploy with a typo message rather than silently shipping the default.  Calling `WebSocketClient.from_config(...)` when `chumicro_sockets.sockets_factory` is missing — either skipped at deploy time or not installed by `circup` / `mip` — raises `RuntimeError` naming the bypass kwarg.
 
 For the full single-library adoption recipe — your transport, your `ticks=`, the runner-less drive loop, and host tests with no board — see [Standalone integration](https://github.com/ChuMicro/ChuMicro/blob/main/docs/contributing/standalone-integration.md).
 
@@ -181,7 +212,7 @@ MCU RAM, 2 MB physical / ~800 KB usable flash):
 `wss://` client connections reuse `chumicro_sockets.connector(tls=True)` + `chumicro_sockets.ssl_context_with_ca`, with the same live-board constraints HTTPS clients have:
 
 - **Device RTC must be set before `wss://`.**  mbedTLS rejects every cert as "validity starts in the future" if the RTC is at boot default.  Use [`chumicro-ntp`](https://chumicro.github.io/ChuMicro/ntp/stable/) to set the clock first.
-- **CA pinning is required.**  Build the `ssl_context` with `chumicro_sockets.ssl_context_with_ca(pem)` and pass it through `chumicro_sockets_connector_factory(radio=..., ssl_context=ctx)`.
+- **CA pinning is required.**  Build the `ssl_context` with `chumicro_sockets.ssl_context_with_ca(pem)` and pass it through `connector_factory(radio=..., ssl_context=ctx)`.
 - **Pi Pico W needs flash deploy mode for `wss://`** — RAM-mode leaves <50 KB free for the mbedTLS handshake.
 
 ## Per-tick knobs
