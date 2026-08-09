@@ -56,7 +56,7 @@
         "msgpack/examples/stream_roundtrip.py"
       ],
       "readme_path": "msgpack/README.md",
-      "version": "0.2.4"
+      "version": "0.2.5"
     },
     "chumicro_ntp": {
       "description": "Runner-shaped SNTP client over an injected UDP socket: pure Python, cross-runtime.",
@@ -142,5 +142,5 @@
       "version": "0.10.0"
     }
   },
-  "tag": "20260809.213232"
+  "tag": "20260809.215530"
 }
