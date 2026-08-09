@@ -139,8 +139,8 @@
         "wifi/examples/connect_to_ap.py"
       ],
       "readme_path": "wifi/README.md",
-      "version": "0.10.0"
+      "version": "0.11.0"
     }
   },
-  "tag": "20260809.215530"
+  "tag": "20260809.231053"
 }
