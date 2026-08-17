@@ -92,7 +92,7 @@
         "runner/examples/sensor_threshold.py"
       ],
       "readme_path": "runner/README.md",
-      "version": "0.21.0"
+      "version": "0.22.0"
     },
     "chumicro_sockets": {
       "description": "Cross-runtime TCP, TLS, and UDP sockets for CircuitPython, MicroPython, and CPython",
@@ -142,5 +142,5 @@
       "version": "0.11.0"
     }
   },
-  "tag": "20260809.231053"
+  "tag": "20260817.233436"
 }
