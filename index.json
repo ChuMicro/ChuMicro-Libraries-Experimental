@@ -34,7 +34,7 @@
         "http_server/examples/simple_server.py"
       ],
       "readme_path": "http_server/README.md",
-      "version": "0.21.2"
+      "version": "0.21.3"
     },
     "chumicro_knobs": {
       "description": "Rotary encoders and analog knobs, read as a position that holds still",
@@ -63,7 +63,7 @@
         "mqtt/examples/telemetry.py"
       ],
       "readme_path": "mqtt/README.md",
-      "version": "0.30.2"
+      "version": "0.30.3"
     },
     "chumicro_msgpack": {
       "description": "Compact MessagePack serialization for CircuitPython, MicroPython, and CPython: delegates to the native C module when available.",
@@ -83,7 +83,7 @@
         "ntp/examples/ntp_query.py"
       ],
       "readme_path": "ntp/README.md",
-      "version": "0.15.2"
+      "version": "0.15.3"
     },
     "chumicro_requests": {
       "description": "Non-blocking HTTP/1.1 client for CircuitPython, MicroPython, and CPython.",
@@ -93,7 +93,7 @@
         "requests/examples/periodic_get.py"
       ],
       "readme_path": "requests/README.md",
-      "version": "0.21.2"
+      "version": "0.21.3"
     },
     "chumicro_runner": {
       "description": "Tick-based task runner for CircuitPython, MicroPython, and CPython: non-blocking check/handle scheduling without async.",
@@ -149,7 +149,7 @@
         "websockets/examples/server.py"
       ],
       "readme_path": "websockets/README.md",
-      "version": "0.27.2"
+      "version": "0.27.3"
     },
     "chumicro_wifi": {
       "description": "Unified wifi supervisor across CircuitPython, MicroPython, and CPython: sole-supervisor model with reconnect, state machine, and per-runtime adapters.",
@@ -160,5 +160,5 @@
       "version": "0.11.2"
     }
   },
-  "tag": "20260823.182703"
+  "tag": "20260823.222304"
 }
