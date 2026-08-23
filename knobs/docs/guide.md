@@ -37,6 +37,23 @@ from machine import Pin
 volume = Encoder(Pin(16), Pin(17))
 ```
 
+In a program with more going on, hand the loop to `chumicro-runner` and let the callback do the reading:
+
+```python
+from chumicro_runner import Runner
+
+volume.on_change = lambda detents: print("volume", volume.position)
+
+runner = Runner()
+runner.add(volume)
+
+while True:
+    now = runner.tick()
+    runner.wait(now)
+```
+
+The [runner section](#runner-pattern) below covers pacing an analog knob's conversions with `period_ms`.
+
 ## Reading the encoder
 
 Every reading is a plain attribute, refreshed by `check()`:
@@ -152,6 +169,21 @@ while True:
 
     if brightness.just_moved:
         print("brightness", brightness.value)     # 0 through 9
+```
+
+Or on the runner, paced to fifty conversions a second:
+
+```python
+from chumicro_runner import Runner
+
+brightness.on_change = lambda step: print("brightness", step)
+
+runner = Runner()
+runner.add(brightness, period_ms=20)
+
+while True:
+    now = runner.tick()
+    runner.wait(now)
 ```
 
 `steps` defaults to 100, held in `DEFAULT_STEPS`, which puts the middle of the sweep at 50 and the top at 99.  `delta` is the change for this tick, negative when the knob comes back down, and `raw` is the settled reading on the 0 to 65535 scale that `value` was worked out from:
