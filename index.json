@@ -7,7 +7,7 @@
         "buttons/examples/micropython_button_toggle.py"
       ],
       "readme_path": "buttons/README.md",
-      "version": "0.1.1"
+      "version": "0.1.2"
     },
     "chumicro_compat": {
       "description": "Cross-runtime compatibility polyfills for CircuitPython, MicroPython, and CPython: functools.partial and more.",
@@ -43,7 +43,7 @@
         "knobs/examples/micropython_encoder_volume.py"
       ],
       "readme_path": "knobs/README.md",
-      "version": "0.1.1"
+      "version": "0.1.2"
     },
     "chumicro_kvstore": {
       "description": "Tiny mutable key-value store for persisted runtime state (counters, timestamps, tokens) across CircuitPython, MicroPython, and CPython.",
@@ -160,5 +160,5 @@
       "version": "0.11.2"
     }
   },
-  "tag": "20260823.181100"
+  "tag": "20260823.182703"
 }
